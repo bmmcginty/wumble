@@ -1,0 +1,8 @@
+name: wumble
+version: 0.1.0
+description: A WebRTC-to-Mumble gateway with one audio track per Mumble speaker
+targets:
+  wumble:
+    main: src/wumble.cr
+crystal: ">= 1.10.0"
+license: MIT

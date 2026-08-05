@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wumble</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <main>
+    <h1>Wumble</h1>
+    <p>Direct WebRTC audio tracks from Mumble. Each speaker remains separate.</p>
+    <form id="connect">
+      <label>Server <input name="server" required autocomplete="url" placeholder="mumble.example.net"></label>
+      <label>Port <input name="port" required type="number" min="1" max="65535" value="64738"></label>
+      <label>Username <input name="username" required autocomplete="username"></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password"></label>
+      <button>Connect</button>
+    </form>
+    <p id="status" role="status">Not connected</p>
+    <section id="speakers" aria-label="Speakers"></section>
+  </main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
