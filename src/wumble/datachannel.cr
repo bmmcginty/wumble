@@ -1,7 +1,28 @@
 @[Link("datachannel")]
 lib LibDataChannel
   alias Handle = Int32
-  fun rtc_create_peer_connection = rtcCreatePeerConnection(config : Void*) : Handle
+
+  # Matches rtcConfiguration in libdatachannel's C API. libdatachannel 0.24
+  # dereferences this argument, so a null pointer is not a valid "defaults"
+  # configuration.
+  struct Configuration
+    ice_servers : UInt8**
+    ice_servers_count : Int32
+    proxy_server : UInt8*
+    bind_address : UInt8*
+    certificate_type : Int32
+    ice_transport_policy : Int32
+    enable_ice_tcp : Bool
+    enable_ice_udp_mux : Bool
+    disable_auto_negotiation : Bool
+    force_media_transport : Bool
+    port_range_begin : UInt16
+    port_range_end : UInt16
+    mtu : Int32
+    max_message_size : Int32
+  end
+
+  fun rtc_create_peer_connection = rtcCreatePeerConnection(config : Configuration*) : Handle
   fun rtc_delete_peer_connection = rtcDeletePeerConnection(pc : Handle)
   fun rtc_set_remote_description = rtcSetRemoteDescription(pc : Handle, sdp : UInt8*, type : UInt8*) : Int32
   fun rtc_add_remote_candidate = rtcAddRemoteCandidate(pc : Handle, candidate : UInt8*, mid : UInt8*) : Int32
@@ -19,8 +40,10 @@ module Wumble
     @timestamp = Hash(UInt32, UInt32).new(0_u32)
 
     def initialize
-      # A null configuration asks libdatachannel to use its default ICE setup.
-      @pc = LibDataChannel.rtc_create_peer_connection(Pointer(Void).null)
+      # libdatachannel requires a real (zero-initialized) configuration to use
+      # its defaults; passing NULL segfaults in libdatachannel 0.24.
+      config = LibDataChannel::Configuration.new
+      @pc = LibDataChannel.rtc_create_peer_connection(pointerof(config))
       raise "rtcCreatePeerConnection failed" if @pc < 0
     end
 
