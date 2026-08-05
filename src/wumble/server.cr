@@ -14,40 +14,12 @@ module Wumble
     getter password : String
   end
 
-  module Signalling
-    @@sockets = {} of LibDataChannel::Handle => HTTP::WebSocket
-    @@lock = Mutex.new
-
-    def self.register(peer : Peer, socket : HTTP::WebSocket)
-      @@lock.synchronize { @@sockets[peer.pc] = socket }
-      LibDataChannel.rtc_set_local_description_callback(peer.pc, ->local_description(LibDataChannel::Handle, UInt8*, UInt8*, Void*))
-      LibDataChannel.rtc_set_local_candidate_callback(peer.pc, ->candidate(LibDataChannel::Handle, UInt8*, UInt8*, Void*))
-    end
-
-    def self.remove(peer : Peer)
-      @@lock.synchronize { @@sockets.delete(peer.pc) }
-      peer.close
-    end
-
-    def self.local_description(pc : LibDataChannel::Handle, sdp : UInt8*, type : UInt8*, _user : Void*)
-      send(pc, {type: "answer", sdp: String.new(sdp), description_type: String.new(type)}.to_json)
-    end
-
-    def self.candidate(pc : LibDataChannel::Handle, candidate : UInt8*, mid : UInt8*, _user : Void*)
-      send(pc, {type: "candidate", candidate: String.new(candidate), mid: String.new(mid)}.to_json)
-    end
-
-    private def self.send(pc, payload)
-      @@lock.synchronize { @@sockets[pc]?.try &.send(payload) }
-    end
-  end
-
   class Gateway
     def initialize(@web_root : String)
     end
 
     def run(bind : String, port : Int32)
-      websocket = HTTP::WebSocketHandler.new { |socket, context| context.request.path == "/signal" ? handle_socket(socket) : socket.close }
+      websocket = HTTP::WebSocketHandler.new { |socket, context| puts context.request.path; context.request.path == "/ws" ? handle_socket(socket) : socket.close }
       HTTP::Server.new([websocket]) { |context| serve(context); nil }.listen(bind, port)
     end
 
@@ -63,13 +35,24 @@ module Wumble
             request = ConnectRequest.from_json(data["options"].to_json)
             validate(request)
             peer = Peer.new
-            Signalling.register(peer.not_nil!, socket)
             mumble = MumbleConnection.new(request.server, request.port, request.username, request.password)
             mumble.not_nil!.on_voice { |speaker, opus| peer.not_nil!.send_opus(speaker, opus) }
             mumble.not_nil!.connect
             socket.send({type: "connected"}.to_json)
           when "offer"
-            peer.try &.accept_offer(data["sdp"].as_s)
+            raise "connect before sending an offer" unless peer
+            current_peer = peer.not_nil!
+            current_peer.accept_offer(data["sdp"].as_s)
+            spawn do
+              begin
+                # Give ICE gathering time to add host candidates to the SDP.
+                sleep 1.second
+                answer = current_peer.local_description || raise "libdatachannel did not produce an answer"
+                socket.send({type: "answer", sdp: answer, description_type: "answer"}.to_json)
+              rescue ex
+                socket.send({type: "error", message: ex.message || "failed to create WebRTC answer"}.to_json)
+              end
+            end
           when "candidate"
             peer.try &.add_candidate(data["candidate"].as_s, data["mid"]?.try(&.as_s) || "0")
           else
@@ -81,7 +64,7 @@ module Wumble
       end
       socket.on_close do
         mumble.try &.close
-        peer.try { |value| Signalling.remove(value) }
+        peer.try &.close
       end
     end
 

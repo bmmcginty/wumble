@@ -26,8 +26,7 @@ lib LibDataChannel
   fun rtc_delete_peer_connection = rtcDeletePeerConnection(pc : Handle)
   fun rtc_set_remote_description = rtcSetRemoteDescription(pc : Handle, sdp : UInt8*, type : UInt8*) : Int32
   fun rtc_add_remote_candidate = rtcAddRemoteCandidate(pc : Handle, candidate : UInt8*, mid : UInt8*) : Int32
-  fun rtc_set_local_description_callback = rtcSetLocalDescriptionCallback(pc : Handle, callback : (Handle, UInt8*, UInt8*, Void* ->)) : Int32
-  fun rtc_set_local_candidate_callback = rtcSetLocalCandidateCallback(pc : Handle, callback : (Handle, UInt8*, UInt8*, Void* ->)) : Int32
+  fun rtc_get_local_description = rtcGetLocalDescription(pc : Handle, buffer : UInt8*, size : Int32) : Int32
   fun rtc_add_track = rtcAddTrack(pc : Handle, sdp : UInt8*) : Handle
   fun rtc_send_message = rtcSendMessage(track : Handle, data : UInt8*, size : Int32) : Int32
 end
@@ -53,6 +52,17 @@ module Wumble
 
     def add_candidate(candidate : String, mid : String)
       check LibDataChannel.rtc_add_remote_candidate(@pc, candidate.to_unsafe, mid.to_unsafe)
+    end
+
+    # Do not use libdatachannel's callbacks here. They run on its native C++
+    # thread, which cannot enter Crystal's GC/runtime. Polling from the Crystal
+    # signalling fiber keeps all WebSocket and GC work on Crystal-managed threads.
+    def local_description : String?
+      buffer = Bytes.new(65_536, 0_u8)
+      result = LibDataChannel.rtc_get_local_description(@pc, buffer.to_unsafe, buffer.size)
+      return nil if result == -3 # RTC_ERR_NOT_AVAIL while the answer is pending
+      check result
+      String.new(buffer.to_unsafe)
     end
 
     # One sendonly RTP track is created for every Mumble session. This is the
