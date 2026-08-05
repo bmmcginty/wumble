@@ -67,9 +67,9 @@ module Wumble
         header = Bytes.new(6)
         io.read_fully(header)
         type = IO::ByteFormat::BigEndian.decode(UInt16, header[0, 2]).to_i
-        size = IO::ByteFormat::BigEndian.decode(UInt32, header[2, 4]).to_i
-        raise "Mumble control packet exceeds 8 MiB" if size > 8 * 1024 * 1024
-        payload = Bytes.new(size)
+        wire_size = IO::ByteFormat::BigEndian.decode(UInt32, header[2, 4])
+        raise "Mumble control packet exceeds 8 MiB" if wire_size > 8_388_608_u32
+        payload = Bytes.new(wire_size.to_i)
         io.read_fully(payload)
         case type
         when USER_STATE then update_user(payload)
@@ -98,11 +98,12 @@ module Wumble
       return if packet.empty? || (packet[0] >> 5) != 4 # UDPVoiceOpus
       offset = 1
       session, offset = Protobuf.read_varint(packet, offset)
+      return if session > UInt32::MAX
       _sequence, offset = Protobuf.read_varint(packet, offset)
       size, offset = Protobuf.read_varint(packet, offset)
       size &= 0x1fff_u64 # Mumble's high bit is the end-of-transmission marker.
+      return if offset > packet.size || size > (packet.size - offset).to_u64
       finish = offset + size.to_i
-      return if finish > packet.size
       @on_voice.try &.call(session.to_u32, packet[offset...finish])
     end
   end

@@ -51,8 +51,9 @@ module Wumble
           yield number, wire, varint(value)
         when 2
           length, offset = read_varint(data, offset)
+          remaining = data.size - offset
+          raise "truncated protobuf field" if length > remaining.to_u64
           finish = offset + length.to_i
-          raise "truncated protobuf field" if finish > data.size
           yield number, wire, data[offset...finish]
           offset = finish
         when 5
