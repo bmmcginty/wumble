@@ -18,7 +18,7 @@ module Wumble
     CODEC_VERSION = 21
 
     getter users = Hash(UInt32, String).new
-    getter on_voice : Proc(UInt32, Bytes, Nil)?
+    getter on_voice : Proc(UInt32, Bytes, UInt32?, Nil)?
     getter on_voice_end : Proc(UInt32, Nil)?
     getter on_user : Proc(UInt32, String, Nil)?
     getter on_ready : Proc(Nil)?
@@ -36,7 +36,7 @@ module Wumble
       @udp_unavailable = false
     end
 
-    def on_voice(&block : UInt32, Bytes ->)
+    def on_voice(&block : UInt32, Bytes, UInt32? ->)
       @on_voice = block
     end
 
@@ -301,11 +301,12 @@ module Wumble
       return if offset > packet.size || size > (packet.size - offset).to_u64
       finish = offset + size.to_i
       opus = packet[offset...finish]
-      forward_opus(session.to_u32, opus, terminator)
+      forward_opus(session.to_u32, opus, terminator, nil)
     end
 
     private def receive_protobuf_audio(payload : Bytes)
       session = nil.as(UInt32?)
+      frame_number = nil.as(UInt32?)
       opus = nil.as(Bytes?)
       terminator = false
       Protobuf.fields(payload) do |number, wire, value|
@@ -313,6 +314,9 @@ module Wumble
         when 3
           sender, _offset = Protobuf.read_varint(value, 0)
           session = sender.to_u32 if wire == 0 && sender <= UInt32::MAX
+        when 4
+          frame, _offset = Protobuf.read_varint(value, 0)
+          frame_number = frame.to_u32 if wire == 0 && frame <= UInt32::MAX
         when 5
           opus = value if wire == 2
         when 16
@@ -320,13 +324,13 @@ module Wumble
         end
       end
       return unless session
-      forward_opus(session.not_nil!, opus.not_nil!, terminator) if opus
+      forward_opus(session.not_nil!, opus.not_nil!, terminator, frame_number) if opus
       @on_voice_end.try &.call(session.not_nil!) if terminator && !opus
     end
 
-    private def forward_opus(session : UInt32, opus : Bytes, terminator : Bool)
-      STDERR.puts "Mumble: forwarding #{opus.size}-byte native UDP Opus packet from session #{session}"
-      @on_voice.try &.call(session, opus)
+    private def forward_opus(session : UInt32, opus : Bytes, terminator : Bool, frame_number : UInt32?)
+      STDERR.puts "Mumble: forwarding #{opus.size}-byte native UDP Opus packet from session #{session} frame=#{frame_number}"
+      @on_voice.try &.call(session, opus, frame_number)
       @on_voice_end.try &.call(session) if terminator
     end
   end

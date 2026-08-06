@@ -5,6 +5,7 @@ let socket;
 let peer;
 let heartbeat;
 let statsTimer;
+const speakerInfoByMid = new Map();
 
 function metric(value) {
   return typeof value === 'number' ? Math.round(value * 1000) / 1000 : null;
@@ -113,23 +114,31 @@ async function makeOffer(speakerCount = 1) {
     browserError('ICE candidate error', { url, errorCode, errorText });
   };
   peer.onsignalingstatechange = () => browserLog('signalling state', { state: peer.signalingState });
-  peer.ontrack = ({ track, streams }) => {
-    browserLog('received remote track', { id: track.id, kind: track.kind, streams: streams.length });
+  peer.ontrack = ({ track, streams, transceiver }) => {
+    const speaker = speakerInfoByMid.get(transceiver?.mid);
+    const label = speaker ? `${speaker.name} (session ${speaker.session})` : 'Unknown speaker';
+    browserLog('received remote track', { id: track.id, kind: track.kind, streams: streams.length, mid: transceiver?.mid, speaker });
     // Do not combine tracks into one MediaStream. One received track means one
     // Mumble speaker and gets its own audio element and jitter buffer.
+    const container = document.createElement('article');
+    const heading = document.createElement('h2');
+    heading.textContent = label;
     const audio = document.createElement('audio');
     audio.autoplay = true;
     audio.controls = true;
+    audio.title = label;
     audio.srcObject = streams[0] || new MediaStream([track]);
     audio.dataset.trackId = track.id;
-    audio.onplaying = () => browserLog('speaker audio playing', { track: track.id, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
-    audio.onwaiting = () => browserLog('speaker audio waiting', { track: track.id, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
-    audio.onstalled = () => browserLog('speaker audio stalled', { track: track.id });
-    audio.onerror = () => browserLog('speaker audio error', { track: track.id, error: audio.error?.message });
-    track.onmute = () => browserLog('remote track muted', { id: track.id });
-    track.onunmute = () => browserLog('remote track unmuted', { id: track.id });
-    speakers.append(audio);
-    track.onended = () => { browserLog('remote track ended', { id: track.id }); audio.remove(); };
+    audio.dataset.session = speaker?.session ?? '';
+    audio.onplaying = () => browserLog('speaker audio playing', { track: track.id, session: speaker?.session ?? null, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
+    audio.onwaiting = () => browserLog('speaker audio waiting', { track: track.id, session: speaker?.session ?? null, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
+    audio.onstalled = () => browserLog('speaker audio stalled', { track: track.id, session: speaker?.session ?? null });
+    audio.onerror = () => browserLog('speaker audio error', { track: track.id, session: speaker?.session ?? null, error: audio.error?.message });
+    track.onmute = () => browserLog('remote track muted', { id: track.id, session: speaker?.session ?? null });
+    track.onunmute = () => browserLog('remote track unmuted', { id: track.id, session: speaker?.session ?? null });
+    container.append(heading, audio);
+    speakers.append(container);
+    track.onended = () => { browserLog('remote track ended', { id: track.id, session: speaker?.session ?? null }); container.remove(); };
   };
   const offer = await peer.createOffer({ offerToReceiveAudio: true });
   await peer.setLocalDescription(offer);
@@ -162,6 +171,8 @@ form.addEventListener('submit', (event) => {
       browserLog('creating offer', { speakers: message.speakers });
       await makeOffer(message.speakers);
     } else if (message.type === 'answer') {
+      speakerInfoByMid.clear();
+      for (const speaker of message.speakers || []) speakerInfoByMid.set(speaker.mid, speaker);
       await peer.setRemoteDescription({ type: message.description_type, sdp: message.sdp });
       browserLog('accepted WebRTC answer', { sdpBytes: message.sdp.length });
       setStatus('Connected');

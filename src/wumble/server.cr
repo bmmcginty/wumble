@@ -46,7 +46,7 @@ module Wumble
             peer = Peer.new
             mumble = MumbleConnection.new(request.server, request.port, request.username, request.password)
             mumble.not_nil!.on_user { |speaker, _name| peer.not_nil!.prepare_speaker(speaker) }
-            mumble.not_nil!.on_voice { |speaker, opus| peer.not_nil!.send_opus(speaker, opus) }
+            mumble.not_nil!.on_voice { |speaker, opus, frame_number| peer.not_nil!.send_opus(speaker, opus, frame_number) }
             mumble.not_nil!.on_voice_end { |speaker| peer.not_nil!.end_voice(speaker) }
             # Wait for both synchronization and a working native UDP path.
             # TCP UDPTunnel voice is deliberately not a fallback because its
@@ -75,7 +75,10 @@ module Wumble
                 # Give ICE gathering time to add host candidates to the SDP.
                 sleep 1.second
                 answer = current_peer.local_description || raise "libdatachannel did not produce an answer"
-                socket.send({type: "answer", sdp: answer, description_type: "answer"}.to_json)
+                speakers = current_peer.speaker_mids.map do |session, mid|
+                  {session: session, mid: mid, name: mumble.not_nil!.users[session]? || "Session #{session}"}
+                end
+                socket.send({type: "answer", sdp: answer, description_type: "answer", speakers: speakers}.to_json)
                 STDERR.puts "WebRTC signalling: sent answer (#{answer.bytesize} bytes)"
               rescue ex
                 STDERR.puts "WebRTC answer error: #{ex.message || ex.class.name}"

@@ -50,6 +50,8 @@ module Wumble
     @opus_payload_types = Hash(String, UInt8).new
     @mid_extension_ids = Hash(String, UInt8).new
     @track_mids = Hash(UInt32, String).new
+
+    getter speaker_mids = Hash(UInt32, String).new
     @sequence = Hash(UInt32, UInt16).new(0_u16)
     @timestamp = Hash(UInt32, UInt32).new(0_u32)
     @first_packet = Hash(UInt32, Bool).new(true)
@@ -105,11 +107,15 @@ module Wumble
     # important boundary: no decoder, mixer, or shared browser MediaStream exists.
     # Live voice takes priority over continuity, so packets produced before a
     # track is open are discarded rather than creating a stale playout backlog.
-    def send_opus(session : UInt32, opus : Bytes)
+    # Mumble's protobuf Audio.frame_number counts 10 ms (480 sample) frames.
+    # Use it when available rather than inferring the duration from the Opus
+    # TOC: a mismatched inferred duration makes the browser conceal samples and
+    # steadily expand its jitter buffer.
+    def send_opus(session : UInt32, opus : Bytes, frame_number : UInt32? = nil)
       prepare_speaker(session)
       if track = @tracks[session]?
         if LibDataChannel.rtc_is_open(track)
-          forward_opus(session, track, opus)
+          forward_opus(session, track, opus, frame_number)
         else
           @dropped_packets[session] += 1
         end
@@ -128,8 +134,9 @@ module Wumble
       @pc = -1
     end
 
-    private def forward_opus(session : UInt32, track : LibDataChannel::Handle, opus : Bytes)
+    private def forward_opus(session : UInt32, track : LibDataChannel::Handle, opus : Bytes, frame_number : UInt32?)
       duration = opus_duration_samples(opus)
+      @timestamp[session] = frame_number.not_nil! &* 480_u32 if frame_number
       mid = @track_mids[session]
       payload_type = @opus_payload_types[mid]
       # BUNDLE requires the MID extension to associate an RTP SSRC with its
@@ -174,6 +181,7 @@ module Wumble
       STDERR.puts "WebRTC: added Opus track session=#{session} mid=#{mid} track=#{track} ssrc=#{session} payload_type=#{payload_type} mid_extension=#{@mid_extension_ids[mid]?}" if debug?
       @tracks[session] = track
       @track_mids[session] = mid
+      @speaker_mids[session] = mid
     end
 
     private def mid_extension_ids(sdp : String) : Hash(String, UInt8)
