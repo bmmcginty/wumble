@@ -17,7 +17,6 @@ let reconnectAttempts = 0;
 let reconnectEnabled = false;
 let connectionActive = false;
 let wakeLock;
-let speakerAudioContext;
 const speakerInfoByMid = new Map();
 const currentChannelSessions = new Set();
 const connectionFragmentFields = [
@@ -197,20 +196,6 @@ function stopMicrophone() {
   microphoneStream = undefined;
 }
 
-function ensureSpeakerAudioContext() {
-  if (speakerAudioContext?.state !== 'closed') {
-    void speakerAudioContext?.resume();
-    return speakerAudioContext;
-  }
-  const AudioContext = window.AudioContext || window.webkitAudioContext;
-  if (!AudioContext) return undefined;
-  speakerAudioContext = new AudioContext();
-  // Call this directly from Connect's user gesture: iOS requires that to
-  // authorize Web Audio output, and it ignores HTMLMediaElement.volume.
-  void speakerAudioContext.resume();
-  return speakerAudioContext;
-}
-
 async function sendOffer() {
   const offer = await peer.createOffer({ offerToReceiveAudio: true });
   await peer.setLocalDescription(offer);
@@ -295,37 +280,24 @@ async function makeOffer(speakerCount = 1) {
     audio.autoplay = true;
     audio.controls = true;
     audio.title = label;
-    const speakerStream = new MediaStream([track]);
-    audio.srcObject = speakerStream;
-    let gain;
-    const audioContext = ensureSpeakerAudioContext();
-    if (audioContext) {
-      try {
-        const source = audioContext.createMediaStreamSource(speakerStream);
-        gain = audioContext.createGain();
-        source.connect(gain).connect(audioContext.destination);
-        // Web Audio performs the actual gain adjustment. Keep the hidden
-        // media element muted so it cannot duplicate the routed output.
-        audio.muted = true;
-      } catch (error) {
-        browserLog('speaker gain routing unavailable', { session: speaker?.session ?? null, message: String(error) });
-      }
-    }
+    audio.srcObject = streams[0] || new MediaStream([track]);
     audio.dataset.trackId = track.id;
     audio.dataset.session = speaker?.session ?? '';
+//    const volumeLabel = document.createElement('label');
+//    volumeLabel.textContent = 'Volume';
     const volume = document.createElement('input');
     volume.type = 'range';
     volume.min = '0';
     volume.max = '100';
     volume.step = '1';
     volume.value = '100';
-    volume.setAttribute('aria-label', `Volume for ${label}`);
-    volume.addEventListener('input', () => {
+    volume.setAttribute('aria-label', `Volume`);
+//Volume for ${label}`);
+    volume.addEventListener('change', () => {
       const percent = Number(volume.value);
-      const level = Number.isFinite(percent) ? Math.min(100, Math.max(0, percent)) / 100 : 1;
-      if (gain && audioContext) gain.gain.setValueAtTime(level, audioContext.currentTime);
-      else audio.volume = level;
+      audio.volume = Number.isFinite(percent) ? Math.min(100, Math.max(0, percent)) / 100 : 1;
     });
+//    volumeLabel.append(volume);
     audio.onplaying = () => browserLog('speaker audio playing', { track: track.id, session: speaker?.session ?? null, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
     audio.onwaiting = () => browserLog('speaker audio waiting', { track: track.id, session: speaker?.session ?? null, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
     audio.onstalled = () => browserLog('speaker audio stalled', { track: track.id, session: speaker?.session ?? null });
@@ -335,11 +307,7 @@ async function makeOffer(speakerCount = 1) {
     container.dataset.session = speaker?.session ?? '';
     container.append(heading, volume, audio);
     speakers.append(container);
-    track.onended = () => {
-      browserLog('remote track ended', { id: track.id, session: speaker?.session ?? null });
-      gain?.disconnect();
-      container.remove();
-    };
+    track.onended = () => { browserLog('remote track ended', { id: track.id, session: speaker?.session ?? null }); container.remove(); };
   };
   await sendOffer();
 }
@@ -470,7 +438,6 @@ form.addEventListener('submit', async (event) => {
   peer = undefined;
   setStatus('Requesting microphone access…');
   try {
-    ensureSpeakerAudioContext();
     await captureMicrophone();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
