@@ -53,7 +53,9 @@ module Wumble
     def accept_offer(sdp : String)
       check LibDataChannel.rtc_set_remote_description(@pc, sdp.to_unsafe, "offer".to_unsafe)
       @remote_description_set = true
-      @speakers.each { |session| add_speaker_track(session) unless @tracks.has_key?(session) }
+      @speakers.each_with_index do |session, index|
+        add_speaker_track(session, index.to_s) unless @tracks.has_key?(session)
+      end
     end
 
     def add_candidate(candidate : String, mid : String)
@@ -65,7 +67,7 @@ module Wumble
     # point when it is acting as the answerer.
     def prepare_speaker(session : UInt32)
       @speakers << session
-      add_speaker_track(session) if @remote_description_set && !@tracks.has_key?(session)
+      add_speaker_track(session, @tracks.size.to_s) if @remote_description_set && !@tracks.has_key?(session)
     end
 
     # Do not use libdatachannel's callbacks here. They run on its native C++
@@ -101,12 +103,12 @@ module Wumble
       @pc = -1
     end
 
-    private def add_speaker_track(session : UInt32)
+    private def add_speaker_track(session : UInt32, mid : String)
       # A stable, per-speaker SSRC lets the browser expose each voice as an
       # independent MediaStreamTrack.
-      sdp = "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendonly\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1\r\na=ssrc:#{session} cname:wumble-#{session}\r\n"
+      sdp = "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:#{mid}\r\na=sendonly\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1\r\na=ssrc:#{session} cname:wumble-#{session}\r\n"
       track = LibDataChannel.rtc_add_track(@pc, sdp.to_unsafe)
-      raise "rtcAddTrack failed" if track < 0
+      raise "rtcAddTrack failed (#{track})" if track < 0
       @tracks[session] = track
     end
 

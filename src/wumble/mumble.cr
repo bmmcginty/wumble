@@ -24,6 +24,7 @@ module Wumble
 
     def initialize(@host : String, @port : Int32, @username : String, @password : String)
       @crypt = nil.as(CryptState?)
+      @closed = false
     end
 
     def on_voice(&block : UInt32, Bytes ->)
@@ -51,6 +52,8 @@ module Wumble
     end
 
     def close
+      return if @closed
+      @closed = true
       @io.try &.close
     end
 
@@ -101,6 +104,7 @@ module Wumble
         end
       end
     rescue ex
+      @closed = true
       STDERR.puts "Mumble connection closed: #{ex.message || ex.class.name}"
       STDERR.puts ex.backtrace.join('\n') if ENV["WUMBLE_DEBUG"]? == "1"
     end
