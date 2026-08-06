@@ -236,13 +236,27 @@ async function makeOffer(speakerCount = 1) {
     audio.srcObject = streams[0] || new MediaStream([track]);
     audio.dataset.trackId = track.id;
     audio.dataset.session = speaker?.session ?? '';
+    const volumeLabel = document.createElement('label');
+    volumeLabel.textContent = 'Volume';
+    const volume = document.createElement('input');
+    volume.type = 'number';
+    volume.min = '0';
+    volume.max = '100';
+    volume.step = '1';
+    volume.value = '100';
+    volume.setAttribute('aria-label', `Volume for ${label}`);
+    volume.addEventListener('input', () => {
+      const percent = Number(volume.value);
+      audio.volume = Number.isFinite(percent) ? Math.min(100, Math.max(0, percent)) / 100 : 1;
+    });
+    volumeLabel.append(volume);
     audio.onplaying = () => browserLog('speaker audio playing', { track: track.id, session: speaker?.session ?? null, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
     audio.onwaiting = () => browserLog('speaker audio waiting', { track: track.id, session: speaker?.session ?? null, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
     audio.onstalled = () => browserLog('speaker audio stalled', { track: track.id, session: speaker?.session ?? null });
     audio.onerror = () => browserLog('speaker audio error', { track: track.id, session: speaker?.session ?? null, error: audio.error?.message });
     track.onmute = () => browserLog('remote track muted', { id: track.id, session: speaker?.session ?? null });
     track.onunmute = () => browserLog('remote track unmuted', { id: track.id, session: speaker?.session ?? null });
-    container.append(heading, audio);
+    container.append(heading, volumeLabel, audio);
     speakers.append(container);
     track.onended = () => { browserLog('remote track ended', { id: track.id, session: speaker?.session ?? null }); container.remove(); };
   };
