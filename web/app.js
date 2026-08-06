@@ -181,7 +181,7 @@ form.addEventListener('submit', async (event) => {
     username: values.get('username'),
     password: values.get('password'),
   };
-  socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/signal`);
+  socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/wumble/ws`);
   socket.onopen = () => {
     setStatus('Connecting to Mumble…');
     signal({ type: 'connect', options });
