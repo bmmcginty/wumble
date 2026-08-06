@@ -5,6 +5,7 @@ let socket;
 let peer;
 let heartbeat;
 let statsTimer;
+let microphoneStream;
 const speakerInfoByMid = new Map();
 
 function metric(value) {
@@ -86,6 +87,23 @@ window.addEventListener('unhandledrejection', ({ reason }) => {
   browserError('unhandled promise rejection', { reason: String(reason) });
 });
 
+async function captureMicrophone() {
+  if (microphoneStream?.active) return;
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone capture is not supported by this browser');
+  // This is intentionally requested inside the Connect tap. While Safari is
+  // capturing a MediaStream, it permits the remote WebRTC audio to autoplay.
+  microphoneStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    video: false,
+  });
+  browserLog('microphone capture enabled');
+}
+
+function stopMicrophone() {
+  microphoneStream?.getTracks().forEach((track) => track.stop());
+  microphoneStream = undefined;
+}
+
 async function makeOffer(speakerCount = 1) {
   peer = new RTCPeerConnection({ iceServers: [] });
   // The answerer maps one sendonly Mumble speaker track to each of these
@@ -145,8 +163,17 @@ async function makeOffer(speakerCount = 1) {
   signal({ type: 'offer', sdp: offer.sdp });
 }
 
-form.addEventListener('submit', (event) => {
+form.addEventListener('submit', async (event) => {
   event.preventDefault();
+  setStatus('Requesting microphone access…');
+  try {
+    await captureMicrophone();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setStatus(`Microphone access is required: ${message}`);
+    browserError('microphone capture failed', { message });
+    return;
+  }
   const values = new FormData(form);
   const options = {
     server: values.get('server'),
@@ -191,6 +218,7 @@ form.addEventListener('submit', (event) => {
   socket.onclose = ({ code, reason }) => {
     window.clearInterval(heartbeat);
     window.clearInterval(statsTimer);
+    stopMicrophone();
     console.info(`Wumble signalling WebSocket closed (${code}: ${reason || 'no reason'})`);
     setStatus(`Disconnected (${code})`);
   };
