@@ -83,6 +83,7 @@ module Wumble
       raise "could not start WebRTC audio receiver" if receiver_fd < 0
       @receiver = IO::FileDescriptor.new(receiver_fd)
       spawn { receive_browser_audio }
+      spawn { log_browser_receiver_debug }
     end
 
     def on_opus(&block : Bytes, UInt32 ->)
@@ -170,6 +171,15 @@ module Wumble
 
     # Packets cross the C bridge through a pipe so all parsing and Mumble I/O
     # runs on a Crystal-managed fiber rather than libdatachannel's threads.
+    private def log_browser_receiver_debug
+      until @closed
+        sleep 5.seconds
+        break if @closed
+        next unless debug?
+        STDERR.puts "WebRTC browser receiver: received=#{LibDataChannel.wumble_receiver_received(@pc)} queued=#{LibDataChannel.wumble_receiver_queued(@pc)} forwarded=#{@browser_packets}"
+      end
+    end
+
     private def receive_browser_audio
       loop do
         header = Bytes.new(2)
