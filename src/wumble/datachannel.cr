@@ -53,7 +53,6 @@ module Wumble
     @sequence = Hash(UInt32, UInt16).new(0_u16)
     @timestamp = Hash(UInt32, UInt32).new(0_u32)
     @first_packet = Hash(UInt32, Bool).new(true)
-    @next_send_at = Hash(UInt32, Time::Instant).new
     @last_debug_at = Time.instant
     @remote_description_set = false
 
@@ -119,11 +118,9 @@ module Wumble
       end
     end
 
-    # A Mumble terminator starts a new talkspurt. Reset the RTP marker and
-    # pacing clock so silence cannot turn into queued playout latency.
+    # A Mumble terminator starts a new talkspurt, so mark its first RTP packet.
     def end_voice(session : UInt32)
       @first_packet[session] = true
-      @next_send_at.delete(session)
     end
 
     def close
@@ -133,7 +130,6 @@ module Wumble
 
     private def forward_opus(session : UInt32, track : LibDataChannel::Handle, opus : Bytes)
       duration = opus_duration_samples(opus)
-      pace_opus(session, duration)
       mid = @track_mids[session]
       payload_type = @opus_payload_types[mid]
       # BUNDLE requires the MID extension to associate an RTP SSRC with its
@@ -178,20 +174,6 @@ module Wumble
       STDERR.puts "WebRTC: added Opus track session=#{session} mid=#{mid} track=#{track} ssrc=#{session} payload_type=#{payload_type} mid_extension=#{@mid_extension_ids[mid]?}" if debug?
       @tracks[session] = track
       @track_mids[session] = mid
-    end
-
-    # Mumble's TCP tunnel is read in batches, while the Opus RTP timestamp
-    # describes 10 ms frames. Sending a batch immediately creates jitter-buffer
-    # latency in Firefox; release its samples on the RTP media clock instead.
-    private def pace_opus(session : UInt32, duration : UInt32)
-      now = Time.instant
-      if next_at = @next_send_at[session]?
-        if next_at > now
-          sleep next_at - now
-          now = Time.instant
-        end
-      end
-      @next_send_at[session] = now + (duration.to_f / 48_000).seconds
     end
 
     private def mid_extension_ids(sdp : String) : Hash(String, UInt8)
