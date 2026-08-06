@@ -24,6 +24,7 @@ lib LibDataChannel
     max_message_size : Int32
   end
 
+  fun rtc_init_logger = rtcInitLogger(level : Int32, callback : Void*)
   fun rtc_create_peer_connection = rtcCreatePeerConnection(config : Configuration*) : Handle
   fun rtc_delete_peer_connection = rtcDeletePeerConnection(pc : Handle)
   fun rtc_set_remote_description = rtcSetRemoteDescription(pc : Handle, sdp : UInt8*, type : UInt8*) : Int32
@@ -44,6 +45,9 @@ module Wumble
     @timestamp = Hash(UInt32, UInt32).new(0_u32)
 
     def initialize
+      # Ask libdatachannel to print native error diagnostics to stderr/stdout;
+      # callbacks from its C++ threads are unsafe in Crystal.
+      LibDataChannel.rtc_init_logger(3, Pointer(Void).null)
       # libdatachannel requires a real (zero-initialized) configuration to use
       # its defaults; passing NULL segfaults in libdatachannel 0.24.
       config = LibDataChannel::Configuration.new
@@ -52,7 +56,8 @@ module Wumble
     end
 
     def accept_offer(sdp : String)
-      check LibDataChannel.rtc_set_remote_description(@pc, sdp.to_unsafe, "offer".to_unsafe)
+      result = LibDataChannel.rtc_set_remote_description(@pc, sdp.to_unsafe, "offer".to_unsafe)
+      raise "rtcSetRemoteDescription failed (#{result})" if result < 0
       @remote_description_set = true
       @speakers.each_with_index do |session, index|
         add_speaker_track(session, index.to_s) unless @tracks.has_key?(session)

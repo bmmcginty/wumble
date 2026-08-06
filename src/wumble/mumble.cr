@@ -25,6 +25,7 @@ module Wumble
     def initialize(@host : String, @port : Int32, @username : String, @password : String)
       @crypt = nil.as(CryptState?)
       @alternate_crypt = nil.as(CryptState?)
+      @tcp = nil.as(TCPSocket?)
       @closed = false
     end
 
@@ -43,6 +44,7 @@ module Wumble
     def connect
       STDERR.puts "Mumble: connecting to #{@host}:#{@port} as #{@username.inspect}"
       tcp = TCPSocket.new(@host, @port)
+      @tcp = tcp
       @io = OpenSSL::SSL::Socket::Client.new(tcp, context: insecure_context)
       STDERR.puts "Mumble: TLS connected"
       # Version is itself the packet payload, not an embedded protobuf field.
@@ -56,7 +58,10 @@ module Wumble
     def close
       return if @closed
       @closed = true
-      @io.try &.close
+      # Closing OpenSSL's SSL object while another Crystal fiber is blocked in
+      # SSL_read can crash OpenSSL. Closing the underlying TCP socket wakes the
+      # reader without concurrent SSL_shutdown calls.
+      @tcp.try &.close
     end
 
     private def insecure_context
