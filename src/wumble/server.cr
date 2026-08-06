@@ -45,8 +45,8 @@ module Wumble
             validate(request)
             peer = Peer.new
             mumble = MumbleConnection.new(request.server, request.port, request.username, request.password)
-            mumble.not_nil!.on_disconnect do |reason|
-              type = reason.starts_with?("Mumble rejected authentication") ? "error" : "mumble_disconnected"
+            mumble.not_nil!.on_disconnect do |reason, reconnect|
+              type = reconnect && !reason.starts_with?("Mumble rejected authentication") ? "mumble_disconnected" : "error"
               socket.send({type: type, message: reason}.to_json)
             end
             peer.not_nil!.on_opus { |opus, frame_number| mumble.not_nil!.send_opus(opus, frame_number) }

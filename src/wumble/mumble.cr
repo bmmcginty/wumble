@@ -14,6 +14,7 @@ module Wumble
     REJECT        =  4
     SERVER_SYNC   =  5
     USER_STATE    =  9
+    USER_REMOVE   = 12
     CRYPT_SETUP   = 15
     CODEC_VERSION = 21
 
@@ -24,7 +25,7 @@ module Wumble
     getter on_ready : Proc(Nil)?
     getter on_udp_available : Proc(Nil)?
     getter on_udp_unavailable : Proc(Nil)?
-    getter on_disconnect : Proc(String, Nil)?
+    getter on_disconnect : Proc(String, Bool, Nil)?
     getter synchronized = false
     getter udp_available = false
 
@@ -35,6 +36,7 @@ module Wumble
       @udp = nil.as(UDPSocket?)
       @closed = false
       @udp_unavailable = false
+      @session = nil.as(UInt32?)
     end
 
     def on_voice(&block : UInt32, Bytes, UInt32? ->)
@@ -61,7 +63,7 @@ module Wumble
       @on_udp_unavailable = block
     end
 
-    def on_disconnect(&block : String ->)
+    def on_disconnect(&block : String, Bool ->)
       @on_disconnect = block
     end
 
@@ -150,11 +152,9 @@ module Wumble
         STDERR.puts "Mumble: received #{packet_name(type)} (#{payload.size} bytes)" unless type == UDPTUNNEL
         case type
         when REJECT then reject(payload)
-        when SERVER_SYNC
-          STDERR.puts "Mumble: authenticated and synchronized"
-          @synchronized = true
-          @on_ready.try &.call
+        when SERVER_SYNC then synchronize(payload)
         when USER_STATE  then update_user(payload)
+        when USER_REMOVE then user_removed(payload)
         when CRYPT_SETUP then configure_crypt(payload)
           # Native encrypted UDP is required for voice. Do not feed the TCP
           # fallback into WebRTC, where its head-of-line blocking adds latency.
@@ -168,7 +168,33 @@ module Wumble
       reason = ex.message || ex.class.name
       STDERR.puts "Mumble connection closed: #{reason}"
       STDERR.puts ex.backtrace.join('\n') if ENV["WUMBLE_DEBUG"]? == "1"
-      @on_disconnect.try &.call(reason) unless was_closed
+      @on_disconnect.try &.call(reason, true) unless was_closed
+    end
+
+    private def synchronize(payload : Bytes)
+      Protobuf.fields(payload) do |number, wire, value|
+        next unless number == 1 && wire == 0
+        session, _offset = Protobuf.read_varint(value, 0)
+        @session = session.to_u32 if session <= UInt32::MAX
+      end
+      STDERR.puts "Mumble: authenticated and synchronized"
+      @synchronized = true
+      @on_ready.try &.call
+    end
+
+    private def user_removed(payload : Bytes)
+      removed_session = nil.as(UInt32?)
+      reason = nil.as(String?)
+      Protobuf.fields(payload) do |number, wire, value|
+        case number
+        when 1 then removed_session = Protobuf.read_varint(value, 0)[0].to_u32 if wire == 0
+        when 3 then reason = String.new(value) if wire == 2
+        end
+      end
+      return unless removed_session && removed_session == @session
+      close
+      message = "Mumble session removed#{reason ? ": #{reason}" : ""}"
+      @on_disconnect.try &.call(message, false)
     end
 
     private def reject(payload : Bytes)
@@ -284,6 +310,7 @@ module Wumble
       when REJECT        then "Reject"
       when SERVER_SYNC   then "ServerSync"
       when USER_STATE    then "UserState"
+      when USER_REMOVE   then "UserRemove"
       when CRYPT_SETUP   then "CryptSetup"
       when CODEC_VERSION then "CodecVersion"
       when 24            then "ServerConfig"
