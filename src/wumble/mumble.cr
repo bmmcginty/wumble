@@ -24,6 +24,7 @@ module Wumble
     getter on_ready : Proc(Nil)?
     getter on_udp_available : Proc(Nil)?
     getter on_udp_unavailable : Proc(Nil)?
+    getter on_disconnect : Proc(String, Nil)?
     getter synchronized = false
     getter udp_available = false
 
@@ -58,6 +59,10 @@ module Wumble
 
     def on_udp_unavailable(&block : ->)
       @on_udp_unavailable = block
+    end
+
+    def on_disconnect(&block : String ->)
+      @on_disconnect = block
     end
 
     def connect
@@ -158,9 +163,12 @@ module Wumble
         end
       end
     rescue ex
+      was_closed = @closed
       @closed = true
-      STDERR.puts "Mumble connection closed: #{ex.message || ex.class.name}"
+      reason = ex.message || ex.class.name
+      STDERR.puts "Mumble connection closed: #{reason}"
       STDERR.puts ex.backtrace.join('\n') if ENV["WUMBLE_DEBUG"]? == "1"
+      @on_disconnect.try &.call(reason) unless was_closed
     end
 
     private def reject(payload : Bytes)

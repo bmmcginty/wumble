@@ -8,6 +8,10 @@ let statsTimer;
 let microphoneStream;
 let renegotiationRequested = false;
 let renegotiationInProgress = false;
+let connectionOptions;
+let reconnectTimer;
+let reconnectAttempts = 0;
+let reconnectEnabled = false;
 const speakerInfoByMid = new Map();
 const connectionFragmentFields = [
   { parameter: 'host', input: form.elements.namedItem('server') },
@@ -160,6 +164,8 @@ async function attemptRenegotiation() {
 }
 
 async function makeOffer(speakerCount = 1) {
+  renegotiationRequested = false;
+  renegotiationInProgress = false;
   peer = new RTCPeerConnection({ iceServers: [] });
   // Use the first speaker m= section in both directions. libdatachannel only
   // answers the offered sections it can pair with a local track; a separate
@@ -179,12 +185,18 @@ async function makeOffer(speakerCount = 1) {
   };
   peer.onconnectionstatechange = () => {
     browserLog('peer connection state', { state: peer.connectionState });
-    if (peer.connectionState === 'connected') startMediaStats();
+    if (peer.connectionState === 'connected') {
+      startMediaStats();
+    } else if (peer.connectionState === 'disconnected' || peer.connectionState === 'failed') {
+      socket?.close();
+    }
   };
   peer.oniceconnectionstatechange = () => {
     const details = { state: peer.iceConnectionState };
-    if (peer.iceConnectionState === 'failed') browserError('ICE failed', details);
-    else browserLog('ICE connection state', details);
+    if (peer.iceConnectionState === 'failed') {
+      browserError('ICE failed', details);
+      socket?.close();
+    } else browserLog('ICE connection state', details);
   };
   peer.onicecandidateerror = ({ url, errorCode, errorText }) => {
     browserError('ICE candidate error', { url, errorCode, errorText });
@@ -222,38 +234,36 @@ async function makeOffer(speakerCount = 1) {
   await sendOffer();
 }
 
-form.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  setStatus('Requesting microphone access…');
-  try {
-    await captureMicrophone();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    setStatus(`Microphone access is required: ${message}`);
-    browserError('microphone capture failed', { message });
-    return;
-  }
-  const values = new FormData(form);
-  const options = {
-    server: values.get('server'),
-    port: Number(values.get('port')),
-    username: values.get('username'),
-    password: values.get('password'),
-  };
-  socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/wumble/ws`);
-  socket.onopen = () => {
+function scheduleReconnect() {
+  if (!reconnectEnabled || reconnectTimer) return;
+  const delay = Math.min(1_000 * (2 ** reconnectAttempts), 30_000);
+  reconnectAttempts += 1;
+  setStatus(`Disconnected; reconnecting in ${Math.round(delay / 1_000)} seconds…`);
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = undefined;
+    connectSignalling();
+  }, delay);
+}
+
+function connectSignalling() {
+  const currentSocket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/wumble/ws`);
+  socket = currentSocket;
+  currentSocket.onopen = () => {
+    if (socket !== currentSocket) return;
     setStatus('Connecting to Mumble…');
-    signal({ type: 'connect', options });
+    signal({ type: 'connect', options: connectionOptions });
     browserLog('signalling socket opened');
     // Keep reverse proxies from expiring an otherwise idle signalling socket.
     heartbeat = window.setInterval(() => signal({ type: 'ping' }), 20_000);
   };
-  socket.onmessage = async ({ data }) => {
+  currentSocket.onmessage = async ({ data }) => {
+    if (socket !== currentSocket) return;
     const message = JSON.parse(data);
     browserLog('received signalling message', { type: message.type });
     if (message.type === 'pong') {
       return;
     } else if (message.type === 'connected') {
+      reconnectAttempts = 0;
       browserLog('creating offer', { speakers: message.speakers });
       await makeOffer(message.speakers);
     } else if (message.type === 'answer') {
@@ -269,21 +279,62 @@ form.addEventListener('submit', async (event) => {
       await attemptRenegotiation();
     } else if (message.type === 'candidate') {
       await peer.addIceCandidate({ candidate: message.candidate, sdpMid: message.mid });
-    } else if (message.type === 'udp_unavailable') {
+    } else if (message.type === 'mumble_disconnected') {
+      browserLog('Mumble connection dropped', { message: message.message });
+      currentSocket.close();
+    } else if (message.type === 'udp_unavailable' || message.type === 'error') {
+      reconnectEnabled = false;
       setStatus(`Error: ${message.message}`);
-      window.alert(message.message);
-      socket.close();
-    } else if (message.type === 'error') {
-      setStatus(`Error: ${message.message}`);
-      socket.close();
+      if (message.type === 'udp_unavailable') window.alert(message.message);
+      currentSocket.close();
     }
   };
-  socket.onerror = () => browserLog('signalling WebSocket error');
-  socket.onclose = ({ code, reason }) => {
+  currentSocket.onerror = () => {
+    if (socket === currentSocket) browserLog('signalling WebSocket error');
+  };
+  currentSocket.onclose = ({ code, reason }) => {
+    if (socket !== currentSocket) return;
     window.clearInterval(heartbeat);
     window.clearInterval(statsTimer);
-    stopMicrophone();
+    peer?.close();
+    peer = undefined;
     console.info(`Wumble signalling WebSocket closed (${code}: ${reason || 'no reason'})`);
-    setStatus(`Disconnected (${code})`);
+    if (reconnectEnabled) {
+      scheduleReconnect();
+    } else {
+      stopMicrophone();
+      setStatus(`Disconnected (${code})`);
+    }
   };
+}
+
+form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  window.clearTimeout(reconnectTimer);
+  reconnectTimer = undefined;
+  reconnectEnabled = false;
+  const previousSocket = socket;
+  socket = undefined;
+  previousSocket?.close();
+  peer?.close();
+  peer = undefined;
+  setStatus('Requesting microphone access…');
+  try {
+    await captureMicrophone();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setStatus(`Microphone access is required: ${message}`);
+    browserError('microphone capture failed', { message });
+    return;
+  }
+  const values = new FormData(form);
+  connectionOptions = {
+    server: values.get('server'),
+    port: Number(values.get('port')),
+    username: values.get('username'),
+    password: values.get('password'),
+  };
+  reconnectAttempts = 0;
+  reconnectEnabled = true;
+  connectSignalling();
 });
