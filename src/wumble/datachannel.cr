@@ -1,3 +1,5 @@
+require "set"
+
 @[Link("datachannel")]
 lib LibDataChannel
   alias Handle = Int32
@@ -35,6 +37,8 @@ module Wumble
   class Peer
     getter pc : LibDataChannel::Handle
     @tracks = Hash(UInt32, LibDataChannel::Handle).new
+    @speakers = Set(UInt32).new
+    @remote_description_set = false
     @sequence = Hash(UInt32, UInt16).new(0_u16)
     @timestamp = Hash(UInt32, UInt32).new(0_u32)
 
@@ -48,16 +52,20 @@ module Wumble
 
     def accept_offer(sdp : String)
       check LibDataChannel.rtc_set_remote_description(@pc, sdp.to_unsafe, "offer".to_unsafe)
+      @remote_description_set = true
+      @speakers.each { |session| add_speaker_track(session) unless @tracks.has_key?(session) }
     end
 
     def add_candidate(candidate : String, mid : String)
       check LibDataChannel.rtc_add_remote_candidate(@pc, candidate.to_unsafe, mid.to_unsafe)
     end
 
-    # Register known Mumble sessions before answering the browser offer so its
-    # SDP has one media section for each existing speaker.
+    # Remember known Mumble sessions until the browser offer has installed the
+    # remote media description. libdatachannel rejects rtcAddTrack before that
+    # point when it is acting as the answerer.
     def prepare_speaker(session : UInt32)
-      @tracks[session]? || add_speaker_track(session)
+      @speakers << session
+      add_speaker_track(session) if @remote_description_set && !@tracks.has_key?(session)
     end
 
     # Do not use libdatachannel's callbacks here. They run on its native C++
@@ -74,7 +82,8 @@ module Wumble
     # One sendonly RTP track is created for every Mumble session. This is the
     # important boundary: no decoder, mixer, or shared browser MediaStream exists.
     def send_opus(session : UInt32, opus : Bytes)
-      track = prepare_speaker(session)
+      prepare_speaker(session)
+      track = @tracks[session]? || raise "speaker track is not negotiated yet"
       sequence = @sequence[session] += 1
       timestamp = @timestamp[session] += 960 # 20 ms at Opus' 48 kHz RTP clock
       rtp = Bytes.new(12 + opus.size)

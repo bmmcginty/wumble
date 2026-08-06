@@ -8,8 +8,13 @@ let heartbeat;
 function setStatus(text) { status.textContent = text; }
 function signal(message) { socket.send(JSON.stringify(message)); }
 
-async function makeOffer() {
+async function makeOffer(speakerCount = 1) {
   peer = new RTCPeerConnection({ iceServers: [] });
+  // The answerer maps one sendonly Mumble speaker track to each of these
+  // recvonly media sections; none of the speaker audio is combined.
+  for (let index = 0; index < Math.max(1, speakerCount); index += 1) {
+    peer.addTransceiver('audio', { direction: 'recvonly' });
+  }
   peer.onicecandidate = ({ candidate }) => {
     if (candidate) signal({ type: 'candidate', candidate: candidate.candidate, mid: candidate.sdpMid });
   };
@@ -50,7 +55,7 @@ form.addEventListener('submit', (event) => {
     if (message.type === 'pong') {
       return;
     } else if (message.type === 'connected') {
-      await makeOffer();
+      await makeOffer(message.speakers);
     } else if (message.type === 'answer') {
       await peer.setRemoteDescription({ type: message.description_type, sdp: message.sdp });
       setStatus('Connected');

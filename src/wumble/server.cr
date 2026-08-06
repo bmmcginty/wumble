@@ -45,7 +45,9 @@ module Wumble
             mumble.not_nil!.on_voice { |speaker, opus| peer.not_nil!.send_opus(speaker, opus) }
             # Wait for UserState packets before asking the browser for an offer:
             # the answer then advertises a separate track for every speaker.
-            mumble.not_nil!.on_ready { socket.send({type: "connected"}.to_json) }
+            mumble.not_nil!.on_ready do
+              socket.send({type: "connected", speakers: mumble.not_nil!.users.size}.to_json)
+            end
             mumble.not_nil!.connect
           when "offer"
             raise "connect before sending an offer" unless peer
