@@ -58,6 +58,7 @@ lib LibDataChannel
   fun rtc_add_track = rtcAddTrack(pc : Handle, sdp : UInt8*) : Handle
   fun rtc_set_opus_packetizer = rtcSetOpusPacketizer(track : Handle, init : PacketizerInit*) : Int32
   fun rtc_send_message = rtcSendMessage(track : Handle, data : UInt8*, size : Int32) : Int32
+  fun rtc_set_track_rtp_timestamp = rtcSetTrackRtpTimestamp(track : Handle, timestamp : UInt32) : Int32
   fun rtc_get_buffered_amount = rtcGetBufferedAmount(id : Handle) : Int32
   fun rtc_is_open = rtcIsOpen(id : Handle) : Bool
 end
@@ -71,6 +72,7 @@ module Wumble
     @sent_packets = Hash(UInt32, UInt64).new(0_u64)
     @sent_bytes = Hash(UInt32, UInt64).new(0_u64)
     @opus_payload_types = Hash(String, UInt8).new
+    @timestamp = Hash(UInt32, UInt32).new(0_u32)
     @last_debug_at = Time.instant
     @remote_description_set = false
 
@@ -153,14 +155,16 @@ module Wumble
       end
     end
 
-    private def forward_opus(_session : UInt32, track : LibDataChannel::Handle, opus : Bytes)
-      # The Opus packetizer constructs RTP headers and derives each packet's
-      # duration from its TOC. Mumble packets are not necessarily 20 ms, so
-      # incrementing a hand-built RTP timestamp by a fixed 960 samples makes
-      # the browser discard or misplay streams with another frame duration.
+    private def forward_opus(session : UInt32, track : LibDataChannel::Handle, opus : Bytes)
+      # OpusPacketizer serializes the RTP header but does not advance its
+      # timestamp. A constant timestamp makes a browser treat every packet as
+      # part of one frame and discard the stream. Supply the timestamp before
+      # every sample and advance it by the duration encoded in the Opus TOC.
+      check LibDataChannel.rtc_set_track_rtp_timestamp(track, @timestamp[session])
       check LibDataChannel.rtc_send_message(track, opus.to_unsafe, opus.size)
-      @sent_packets[_session] += 1
-      @sent_bytes[_session] += opus.size.to_u64
+      @timestamp[session] &+= opus_duration_samples(opus)
+      @sent_packets[session] += 1
+      @sent_bytes[session] += opus.size.to_u64
       log_media_debug if debug?
     end
 
@@ -186,6 +190,22 @@ module Wumble
       check LibDataChannel.rtc_set_opus_packetizer(track, pointerof(packetizer))
       STDERR.puts "WebRTC: added Opus track session=#{session} mid=#{mid} track=#{track} ssrc=#{session} payload_type=#{payload_type}" if debug?
       @tracks[session] = track
+    end
+
+    private def opus_duration_samples(opus : Bytes) : UInt32
+      return 960_u32 if opus.empty?
+      config = opus[0] >> 3
+      samples_per_frame = case config
+                          when 0..11 then [480_u32, 960_u32, 1_920_u32, 2_880_u32][config % 4]
+                          when 12..15 then [480_u32, 960_u32][config % 2]
+                          else              [120_u32, 240_u32, 480_u32, 960_u32][config % 4]
+                          end
+      frame_count = case opus[0] & 0x03
+                    when 0 then 1_u32
+                    when 1, 2 then 2_u32
+                    else opus.size > 1 ? (opus[1] & 0x3f).to_u32 : 1_u32
+                    end
+      samples_per_frame * frame_count
     end
 
     private def opus_payload_types(sdp : String) : Hash(String, UInt8)
