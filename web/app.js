@@ -14,6 +14,7 @@ let reconnectTimer;
 let reconnectAttempts = 0;
 let reconnectEnabled = false;
 let connectionActive = false;
+let wakeLock;
 const speakerInfoByMid = new Map();
 const connectionFragmentFields = [
   { parameter: 'host', input: form.elements.namedItem('server') },
@@ -105,6 +106,28 @@ function startMediaStats() {
 }
 
 function setStatus(text) { status.textContent = text; }
+async function requestWakeLock() {
+  if (!connectionActive || document.visibilityState !== 'visible' || !navigator.wakeLock?.request || wakeLock) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = undefined; });
+    browserLog('screen wake lock enabled');
+  } catch (error) {
+    browserLog('screen wake lock unavailable', { message: String(error) });
+  }
+}
+async function releaseWakeLock() {
+  if (!wakeLock) return;
+  const lock = wakeLock;
+  wakeLock = undefined;
+  await lock.release();
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') void requestWakeLock();
+  else void releaseWakeLock();
+});
+window.addEventListener('focus', () => { void requestWakeLock(); });
+window.addEventListener('pagehide', () => { void releaseWakeLock(); });
 function setConnectionActive(active) {
   connectionActive = active;
   connectionToggle.textContent = active ? 'Disconnect' : 'Connect';
@@ -311,6 +334,7 @@ function connectSignalling() {
       browserLog('accepted WebRTC answer', { sdpBytes: message.sdp.length });
       setStatus('Connected');
       setConnectionActive(true);
+      void requestWakeLock();
       await attemptRenegotiation();
     } else if (message.type === 'renegotiate') {
       browserLog('gateway requested WebRTC renegotiation');
@@ -339,6 +363,7 @@ function connectSignalling() {
     peer = undefined;
     console.info(`Wumble signalling WebSocket closed (${code}: ${reason || 'no reason'})`);
     setConnectionActive(false);
+    void releaseWakeLock();
     if (reconnectEnabled) {
       scheduleReconnect();
     } else {
@@ -361,6 +386,7 @@ form.addEventListener('submit', async (event) => {
     window.clearInterval(statsTimer);
     stopMicrophone();
     setConnectionActive(false);
+    void releaseWakeLock();
     setStatus('Disconnected');
     return;
   }
