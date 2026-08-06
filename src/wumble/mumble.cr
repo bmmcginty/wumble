@@ -22,12 +22,18 @@ module Wumble
     getter on_voice_end : Proc(UInt32, Nil)?
     getter on_user : Proc(UInt32, String, Nil)?
     getter on_ready : Proc(Nil)?
+    getter on_udp_available : Proc(Nil)?
+    getter on_udp_unavailable : Proc(Nil)?
+    getter synchronized = false
+    getter udp_available = false
 
     def initialize(@host : String, @port : Int32, @username : String, @password : String)
       @crypt = nil.as(CryptState?)
       @alternate_crypt = nil.as(CryptState?)
       @tcp = nil.as(TCPSocket?)
+      @udp = nil.as(UDPSocket?)
       @closed = false
+      @udp_unavailable = false
     end
 
     def on_voice(&block : UInt32, Bytes ->)
@@ -44,6 +50,14 @@ module Wumble
 
     def on_ready(&block : ->)
       @on_ready = block
+    end
+
+    def on_udp_available(&block : ->)
+      @on_udp_available = block
+    end
+
+    def on_udp_unavailable(&block : ->)
+      @on_udp_unavailable = block
     end
 
     def connect
@@ -67,6 +81,7 @@ module Wumble
       # SSL_read can crash OpenSSL. Closing the underlying TCP socket wakes the
       # reader without concurrent SSL_shutdown calls.
       @tcp.try &.close
+      @udp.try &.close
     end
 
     private def insecure_context
@@ -121,10 +136,13 @@ module Wumble
         when REJECT then reject(payload)
         when SERVER_SYNC
           STDERR.puts "Mumble: authenticated and synchronized"
+          @synchronized = true
           @on_ready.try &.call
         when USER_STATE  then update_user(payload)
         when CRYPT_SETUP then configure_crypt(payload)
-        when UDPTUNNEL   then receive_tunnel(payload)
+        # Native encrypted UDP is required for voice. Do not feed the TCP
+        # fallback into WebRTC, where its head-of-line blocking adds latency.
+        when UDPTUNNEL   then STDERR.puts "Mumble: ignoring TCP UDPTunnel voice; using native UDP"
         end
       end
     rescue ex
@@ -158,7 +176,68 @@ module Wumble
       # Some Murmur versions label nonce directions from the server's point of
       # view. Keep a tag-authenticated alternate state for that wire variant.
       @alternate_crypt = CryptState.new(key.not_nil!, server_nonce.not_nil!, client_nonce.not_nil!)
-      STDERR.puts "Mumble: CryptSetup complete; encrypted voice packets can be decrypted"
+      STDERR.puts "Mumble: CryptSetup complete; starting native UDP voice"
+      start_udp
+    end
+
+    private def start_udp
+      return if @udp || @closed
+      udp = UDPSocket.new
+      udp.connect(@host, @port)
+      @udp = udp
+      spawn { udp_read_loop(udp) }
+      spawn { udp_ping_loop(udp) }
+      spawn do
+        sleep 3.seconds
+        unless @closed || @udp_available
+          @udp_unavailable = true
+          STDERR.puts "Mumble: native UDP is unavailable; TCP UDPTunnel voice will not be used"
+          @on_udp_unavailable.try &.call
+        end
+      end
+    rescue ex
+      @udp_unavailable = true
+      STDERR.puts "Mumble: could not start native UDP: #{ex.message || ex.class.name}"
+      @on_udp_unavailable.try &.call
+    end
+
+    private def udp_ping_loop(udp : UDPSocket)
+      until @closed
+        # Mumble 1.5 native UDP envelopes start with the Ping message type.
+        # A ping proves that the server can route encrypted UDP back to us.
+        plaintext = Bytes[1_u8] + Protobuf.field(1, Time.utc.to_unix_ms.to_u64)
+        udp.send(@crypt.not_nil!.encrypt(plaintext))
+        sleep 1.second
+      end
+    rescue ex
+      STDERR.puts "Mumble UDP send failed: #{ex.message || ex.class.name}" unless @closed
+    end
+
+    private def udp_read_loop(udp : UDPSocket)
+      buffer = Bytes.new(65_535)
+      until @closed
+        size, _source = udp.receive(buffer)
+        plaintext = @crypt.try &.decrypt(buffer[0, size])
+        next unless plaintext
+        native_udp_received
+        receive_native_udp(plaintext)
+      end
+    rescue ex
+      STDERR.puts "Mumble UDP receive failed: #{ex.message || ex.class.name}" unless @closed
+    end
+
+    private def native_udp_received
+      return if @udp_available
+      @udp_available = true
+      STDERR.puts "Mumble: native UDP is available"
+      @on_udp_available.try &.call
+    end
+
+    private def receive_native_udp(packet : Bytes)
+      return if packet.empty?
+      # Mumble 1.5 uses a one-byte UDP message type followed by a protobuf
+      # MumbleUDP.Audio payload. Ping responses require no further handling.
+      receive_protobuf_audio(packet[1..]) if packet[0] == 0_u8
     end
 
     private def update_user(payload : Bytes)
@@ -222,9 +301,7 @@ module Wumble
       return if offset > packet.size || size > (packet.size - offset).to_u64
       finish = offset + size.to_i
       opus = packet[offset...finish]
-      STDERR.puts "Mumble: forwarding #{opus.size}-byte Opus packet from session #{session}"
-      @on_voice.try &.call(session.to_u32, opus)
-      @on_voice_end.try &.call(session.to_u32) if terminator
+      forward_opus(session.to_u32, opus, terminator)
     end
 
     private def receive_protobuf_audio(payload : Bytes)
@@ -238,16 +315,19 @@ module Wumble
           session = sender.to_u32 if wire == 0 && sender <= UInt32::MAX
         when 5
           opus = value if wire == 2
-        when 6
+        when 16
           terminator = Protobuf.read_varint(value, 0)[0] != 0 if wire == 0
         end
       end
       return unless session
-      if opus
-        STDERR.puts "Mumble: forwarding #{opus.not_nil!.size}-byte protobuf Opus packet from session #{session}"
-        @on_voice.try &.call(session.not_nil!, opus.not_nil!)
-      end
-      @on_voice_end.try &.call(session.not_nil!) if terminator
+      forward_opus(session.not_nil!, opus.not_nil!, terminator) if opus
+      @on_voice_end.try &.call(session.not_nil!) if terminator && !opus
+    end
+
+    private def forward_opus(session : UInt32, opus : Bytes, terminator : Bool)
+      STDERR.puts "Mumble: forwarding #{opus.size}-byte native UDP Opus packet from session #{session}"
+      @on_voice.try &.call(session, opus)
+      @on_voice_end.try &.call(session) if terminator
     end
   end
 end

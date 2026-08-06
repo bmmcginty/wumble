@@ -20,7 +20,7 @@ Open `http://gateway-host:8080/` (serve Wumble behind HTTPS in production for iP
 
 The gateway must be able to make TLS TCP connections to the selected Mumble server. libdatachannel also needs UDP reachable between the browser and gateway for WebRTC media. For internet clients, put the gateway on a public address or configure a TURN service in the libdatachannel configuration before deployment.
 
-Mumble voice is carried as Opus. The current transport accepts server `UDPTunnel` voice packets, which is the TCP fallback Mumble servers provide when UDP is unavailable. Production deployments should enable the server's TCP tunnel fallback, or extend `MumbleConnection` with the Mumble CryptState UDP handshake for native UDP voice; neither option requires mixing audio.
+Mumble voice is carried as encrypted native UDP using the `CryptSetup` key material. Wumble sends encrypted UDP pings after authentication and accepts voice only after the server replies over UDP. If that path is unavailable after three seconds, the browser is alerted and no TCP `UDPTunnel` voice is forwarded. Ensure UDP on the selected Mumble port is reachable from the gateway.
 
 ## Design
 

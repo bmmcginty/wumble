@@ -167,6 +167,10 @@ form.addEventListener('submit', (event) => {
       setStatus('Connected');
     } else if (message.type === 'candidate') {
       await peer.addIceCandidate({ candidate: message.candidate, sdpMid: message.mid });
+    } else if (message.type === 'udp_unavailable') {
+      setStatus(`Error: ${message.message}`);
+      window.alert(message.message);
+      socket.close();
     } else if (message.type === 'error') {
       setStatus(`Error: ${message.message}`);
       socket.close();

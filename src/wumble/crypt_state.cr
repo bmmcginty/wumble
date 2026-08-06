@@ -21,6 +21,21 @@ module Wumble
       @history = StaticArray(UInt8, 256).new(0_u8)
     end
 
+    # Encrypts a native UDP payload using the outbound nonce established by
+    # CryptSetup. The wire prefix carries the nonce's low byte and three bytes
+    # of the OCB authentication tag.
+    def encrypt(plaintext : Bytes) : Bytes
+      increment_encrypt_iv
+      ciphertext, tag = ocb_encrypt(plaintext, @encrypt_iv)
+      packet = Bytes.new(ciphertext.size + 4)
+      packet[0] = @encrypt_iv[0]
+      packet[1] = tag[0]
+      packet[2] = tag[1]
+      packet[3] = tag[2]
+      packet[4..].copy_from(ciphertext)
+      packet
+    end
+
     def decrypt(packet : Bytes) : Bytes?
       return nil if packet.size < 4
       saved_iv = @decrypt_iv.dup
@@ -66,6 +81,13 @@ module Wumble
       plaintext
     end
 
+    private def increment_encrypt_iv
+      (0...BLOCK_SIZE).each do |index|
+        @encrypt_iv[index] &+= 1
+        break unless @encrypt_iv[index] == 0
+      end
+    end
+
     private def advance_iv
       (1...BLOCK_SIZE).each do |index|
         @decrypt_iv[index] &+= 1
@@ -79,6 +101,39 @@ module Wumble
         @decrypt_iv[index] &-= 1
         break unless previous == 0
       end
+    end
+
+    private def ocb_encrypt(plaintext : Bytes, nonce : Bytes) : {Bytes, Bytes}
+      checksum = Bytes.new(BLOCK_SIZE, 0_u8)
+      delta = aes_encrypt(nonce)
+      ciphertext = Bytes.new(plaintext.size)
+      remaining = plaintext.size
+      source_offset = 0
+
+      while remaining > BLOCK_SIZE
+        shift2!(delta)
+        block = plaintext[source_offset, BLOCK_SIZE]
+        checksum = xor(checksum, block)
+        ciphertext[source_offset, BLOCK_SIZE].copy_from(xor(delta, aes_encrypt(xor(delta, block))))
+        source_offset += BLOCK_SIZE
+        remaining -= BLOCK_SIZE
+      end
+
+      shift2!(delta)
+      temporary = Bytes.new(BLOCK_SIZE, 0_u8)
+      temporary[BLOCK_SIZE - 1] = (remaining * 8).to_u8
+      pad = aes_encrypt(xor(temporary, delta))
+      temporary = Bytes.new(BLOCK_SIZE, 0_u8)
+      temporary[0, remaining].copy_from(plaintext[source_offset, remaining])
+      ciphertext[source_offset, remaining].copy_from(xor(temporary, pad)[0, remaining])
+      # OCB's final checksum includes the padded ciphertext XOR pad, matching
+      # the value reconstructed by ocb_decrypt for the partial final block.
+      temporary = Bytes.new(BLOCK_SIZE, 0_u8)
+      temporary[0, remaining].copy_from(ciphertext[source_offset, remaining])
+      checksum = xor(checksum, xor(temporary, pad))
+
+      shift3!(delta)
+      {ciphertext, aes_encrypt(xor(delta, checksum))}
     end
 
     private def ocb_decrypt(ciphertext : Bytes, nonce : Bytes) : {Bytes, Bytes}

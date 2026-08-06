@@ -48,10 +48,21 @@ module Wumble
             mumble.not_nil!.on_user { |speaker, _name| peer.not_nil!.prepare_speaker(speaker) }
             mumble.not_nil!.on_voice { |speaker, opus| peer.not_nil!.send_opus(speaker, opus) }
             mumble.not_nil!.on_voice_end { |speaker| peer.not_nil!.end_voice(speaker) }
-            # Wait for UserState packets before asking the browser for an offer:
-            # the answer then advertises a separate track for every speaker.
+            # Wait for both synchronization and a working native UDP path.
+            # TCP UDPTunnel voice is deliberately not a fallback because its
+            # head-of-line blocking causes the latency this gateway avoids.
             mumble.not_nil!.on_ready do
-              socket.send({type: "connected", speakers: mumble.not_nil!.users.size}.to_json)
+              if mumble.not_nil!.udp_available
+                socket.send({type: "connected", speakers: mumble.not_nil!.users.size}.to_json)
+              end
+            end
+            mumble.not_nil!.on_udp_available do
+              if mumble.not_nil!.synchronized
+                socket.send({type: "connected", speakers: mumble.not_nil!.users.size}.to_json)
+              end
+            end
+            mumble.not_nil!.on_udp_unavailable do
+              socket.send({type: "udp_unavailable", message: "Native UDP to the Mumble server is unavailable. Check UDP port #{request.port}."}.to_json)
             end
             mumble.not_nil!.connect
           when "offer"
