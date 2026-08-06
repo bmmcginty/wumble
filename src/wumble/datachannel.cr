@@ -62,6 +62,7 @@ module Wumble
     @first_packet = Hash(UInt32, Bool).new(true)
     @last_debug_at = Time.instant
     @remote_description_set = false
+    @renegotiation_pending = false
 
     def initialize
       # Ask libdatachannel to print native error diagnostics to stderr/stdout;
@@ -85,15 +86,16 @@ module Wumble
       @on_opus = block
     end
 
-    def accept_offer(sdp : String)
+    # Returns true when additional known speakers still need another offered
+    # audio section.
+    def accept_offer(sdp : String) : Bool
       @opus_payload_types = opus_payload_types(sdp)
       @mid_extension_ids = mid_extension_ids(sdp)
       result = LibDataChannel.rtc_set_remote_description(@pc, sdp.to_unsafe, "offer".to_unsafe)
       raise "rtcSetRemoteDescription failed (#{result})" if result < 0
       @remote_description_set = true
-      @speakers.each_with_index do |session, index|
-        add_speaker_track(session, index.to_s) unless @tracks.has_key?(session)
-      end
+      assign_speaker_tracks
+      @renegotiation_pending = @speakers.any? { |session| !@tracks.has_key?(session) }
     end
 
     def add_candidate(candidate : String, mid : String)
@@ -103,9 +105,14 @@ module Wumble
     # Remember known Mumble sessions until the browser offer has installed the
     # remote media description. libdatachannel rejects rtcAddTrack before that
     # point when it is acting as the answerer.
-    def prepare_speaker(session : UInt32)
+    # Returns true when the browser must offer another audio section before
+    # this speaker can be assigned a WebRTC track.
+    def prepare_speaker(session : UInt32) : Bool
       @speakers << session
-      add_speaker_track(session, @tracks.size.to_s) if @remote_description_set && !@tracks.has_key?(session)
+      assign_speaker_tracks if @remote_description_set
+      return false if !@remote_description_set || @tracks.has_key?(session) || @renegotiation_pending
+      @renegotiation_pending = true
+      true
     end
 
     # Do not use libdatachannel's callbacks here. They run on its native C++
@@ -228,6 +235,20 @@ module Wumble
       @sent_packets[session] += 1
       @sent_bytes[session] += opus.size.to_u64
       log_media_debug if debug?
+    end
+
+    private def assign_speaker_tracks
+      @speakers.each do |session|
+        next if @tracks.has_key?(session)
+        mid = available_speaker_mid
+        break unless mid
+        add_speaker_track(session, mid)
+      end
+    end
+
+    private def available_speaker_mid : String?
+      return "0" if @opus_payload_types.has_key?("0") && !@track_mids.values.includes?("0")
+      @opus_payload_types.keys.find { |candidate| !@track_mids.values.includes?(candidate) }
     end
 
     private def add_speaker_track(session : UInt32, mid : String)

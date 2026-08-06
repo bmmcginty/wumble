@@ -46,7 +46,9 @@ module Wumble
             peer = Peer.new
             mumble = MumbleConnection.new(request.server, request.port, request.username, request.password)
             peer.not_nil!.on_opus { |opus, frame_number| mumble.not_nil!.send_opus(opus, frame_number) }
-            mumble.not_nil!.on_user { |speaker, _name| peer.not_nil!.prepare_speaker(speaker) }
+            mumble.not_nil!.on_user do |speaker, _name|
+              socket.send({type: "renegotiate"}.to_json) if peer.not_nil!.prepare_speaker(speaker)
+            end
             mumble.not_nil!.on_voice { |speaker, opus, frame_number| peer.not_nil!.send_opus(speaker, opus, frame_number) }
             mumble.not_nil!.on_voice_end { |speaker| peer.not_nil!.end_voice(speaker) }
             # Wait for both synchronization and a working native UDP path.
@@ -69,7 +71,7 @@ module Wumble
           when "offer"
             raise "connect before sending an offer" unless peer
             current_peer = peer.not_nil!
-            current_peer.accept_offer(data["sdp"].as_s)
+            needs_renegotiation = current_peer.accept_offer(data["sdp"].as_s)
             STDERR.puts "WebRTC signalling: accepted browser offer; waiting for local answer"
             spawn do
               begin
@@ -80,6 +82,7 @@ module Wumble
                   {session: session, mid: mid, name: mumble.not_nil!.users[session]? || "Session #{session}"}
                 end
                 socket.send({type: "answer", sdp: answer, description_type: "answer", speakers: speakers}.to_json)
+                socket.send({type: "renegotiate"}.to_json) if needs_renegotiation
                 STDERR.puts "WebRTC signalling: sent answer (#{answer.bytesize} bytes)"
               rescue ex
                 STDERR.puts "WebRTC answer error: #{ex.message || ex.class.name}"

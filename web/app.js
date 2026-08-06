@@ -6,6 +6,8 @@ let peer;
 let heartbeat;
 let statsTimer;
 let microphoneStream;
+let renegotiationRequested = false;
+let renegotiationInProgress = false;
 const speakerInfoByMid = new Map();
 
 function metric(value) {
@@ -112,6 +114,29 @@ function stopMicrophone() {
   microphoneStream = undefined;
 }
 
+async function sendOffer() {
+  const offer = await peer.createOffer({ offerToReceiveAudio: true });
+  await peer.setLocalDescription(offer);
+  signal({ type: 'offer', sdp: offer.sdp });
+}
+
+async function attemptRenegotiation() {
+  if (!renegotiationRequested || renegotiationInProgress || !peer || peer.signalingState !== 'stable') return;
+  renegotiationRequested = false;
+  renegotiationInProgress = true;
+  try {
+    // The gateway has learned about another Mumble speaker. Add one offered
+    // receive-only audio section so it can answer with that speaker's track.
+    peer.addTransceiver('audio', { direction: 'recvonly' });
+    await sendOffer();
+  } catch (error) {
+    renegotiationRequested = true;
+    browserError('WebRTC renegotiation failed', { message: String(error) });
+  } finally {
+    renegotiationInProgress = false;
+  }
+}
+
 async function makeOffer(speakerCount = 1) {
   peer = new RTCPeerConnection({ iceServers: [] });
   // Use the first speaker m= section in both directions. libdatachannel only
@@ -142,7 +167,10 @@ async function makeOffer(speakerCount = 1) {
   peer.onicecandidateerror = ({ url, errorCode, errorText }) => {
     browserError('ICE candidate error', { url, errorCode, errorText });
   };
-  peer.onsignalingstatechange = () => browserLog('signalling state', { state: peer.signalingState });
+  peer.onsignalingstatechange = () => {
+    browserLog('signalling state', { state: peer.signalingState });
+    void attemptRenegotiation();
+  };
   peer.ontrack = ({ track, streams, transceiver }) => {
     const speaker = speakerInfoByMid.get(transceiver?.mid);
     const label = speaker ? `${speaker.name} (session ${speaker.session})` : 'Unknown speaker';
@@ -169,9 +197,7 @@ async function makeOffer(speakerCount = 1) {
     speakers.append(container);
     track.onended = () => { browserLog('remote track ended', { id: track.id, session: speaker?.session ?? null }); container.remove(); };
   };
-  const offer = await peer.createOffer({ offerToReceiveAudio: true });
-  await peer.setLocalDescription(offer);
-  signal({ type: 'offer', sdp: offer.sdp });
+  await sendOffer();
 }
 
 form.addEventListener('submit', async (event) => {
@@ -214,6 +240,11 @@ form.addEventListener('submit', async (event) => {
       await peer.setRemoteDescription({ type: message.description_type, sdp: message.sdp });
       browserLog('accepted WebRTC answer', { sdpBytes: message.sdp.length });
       setStatus('Connected');
+      await attemptRenegotiation();
+    } else if (message.type === 'renegotiate') {
+      browserLog('gateway requested WebRTC renegotiation');
+      renegotiationRequested = true;
+      await attemptRenegotiation();
     } else if (message.type === 'candidate') {
       await peer.addIceCandidate({ candidate: message.candidate, sdpMid: message.mid });
     } else if (message.type === 'udp_unavailable') {
