@@ -60,6 +60,8 @@ module Wumble
     @sequence = Hash(UInt32, UInt16).new(0_u16)
     @timestamp = Hash(UInt32, UInt32).new(0_u32)
     @first_packet = Hash(UInt32, Bool).new(true)
+    @next_mumble_frame = Hash(UInt32, UInt32).new
+    @mumble_packet_frames = Hash(UInt32, UInt32).new
     @last_debug_at = Time.instant
     @remote_description_set = false
     @renegotiation_pending = false
@@ -148,9 +150,12 @@ module Wumble
       end
     end
 
-    # A Mumble terminator starts a new talkspurt, so mark its first RTP packet.
+    # A Mumble terminator starts a new talkspurt, so mark its first RTP packet
+    # and do not mistake the following silence for lost media.
     def end_voice(session : UInt32)
       @first_packet[session] = true
+      @next_mumble_frame.delete(session)
+      @mumble_packet_frames.delete(session)
     end
 
     def close
@@ -221,6 +226,7 @@ module Wumble
 
     private def forward_opus(session : UInt32, track : LibDataChannel::Handle, opus : Bytes, frame_number : UInt32?)
       duration = opus_duration_samples(opus)
+      preserve_mumble_sequence_gap(session, frame_number, duration)
       @timestamp[session] = frame_number.not_nil! &* 480_u32 if frame_number
       mid = @track_mids[session]
       payload_type = @opus_payload_types[mid]
@@ -251,6 +257,27 @@ module Wumble
       @sent_packets[session] += 1
       @sent_bytes[session] += opus.size.to_u64
       log_media_debug if debug?
+    end
+
+    # RTP timestamps identify the duration of a loss, while RTP sequence gaps
+    # tell the browser's jitter buffer that it should apply Opus PLC. Mumble's
+    # frame number provides both signals when native UDP drops a packet.
+    private def preserve_mumble_sequence_gap(session : UInt32, frame_number : UInt32?, duration : UInt32)
+      return unless frame_number
+      packet_frames = duration // 480_u32
+      return if packet_frames == 0
+      if expected = @next_mumble_frame[session]?
+        gap = frame_number.not_nil! &- expected
+        # A large jump is normal after silence when a terminator was lost; do
+        # not turn it into an unbounded run of synthetic missing RTP packets.
+        if gap > 0_u32 && gap <= 100_u32
+          previous_packet_frames = @mumble_packet_frames[session]? || packet_frames
+          missing_packets = (gap + previous_packet_frames - 1_u32) // previous_packet_frames
+          @sequence[session] &+= missing_packets.to_u16
+        end
+      end
+      @next_mumble_frame[session] = frame_number.not_nil! &+ packet_frames
+      @mumble_packet_frames[session] = packet_frames
     end
 
     private def assign_speaker_tracks
