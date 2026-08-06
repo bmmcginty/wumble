@@ -11,6 +11,16 @@ function browserLog(event, details = {}) {
   console.info(`Wumble: ${event}`, details);
   if (socket?.readyState === WebSocket.OPEN) signal({ type: 'log', event, details });
 }
+function browserError(event, details = {}) {
+  console.error(`Wumble: ${event}`, details);
+  browserLog(event, details);
+}
+window.addEventListener('error', ({ message, filename, lineno, colno }) => {
+  browserError('window error', { message, filename, lineno, colno });
+});
+window.addEventListener('unhandledrejection', ({ reason }) => {
+  browserError('unhandled promise rejection', { reason: String(reason) });
+});
 
 async function makeOffer(speakerCount = 1) {
   peer = new RTCPeerConnection({ iceServers: [] });
@@ -28,7 +38,14 @@ async function makeOffer(speakerCount = 1) {
     }
   };
   peer.onconnectionstatechange = () => browserLog('peer connection state', { state: peer.connectionState });
-  peer.oniceconnectionstatechange = () => browserLog('ICE connection state', { state: peer.iceConnectionState });
+  peer.oniceconnectionstatechange = () => {
+    const details = { state: peer.iceConnectionState };
+    if (peer.iceConnectionState === 'failed') browserError('ICE failed', details);
+    else browserLog('ICE connection state', details);
+  };
+  peer.onicecandidateerror = ({ url, errorCode, errorText }) => {
+    browserError('ICE candidate error', { url, errorCode, errorText });
+  };
   peer.onsignalingstatechange = () => browserLog('signalling state', { state: peer.signalingState });
   peer.ontrack = ({ track, streams }) => {
     browserLog('received remote track', { id: track.id, kind: track.kind, streams: streams.length });

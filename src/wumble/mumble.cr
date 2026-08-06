@@ -49,6 +49,7 @@ module Wumble
       send_packet(VERSION, version)
       authenticate
       spawn { read_loop }
+      spawn { ping_loop }
     end
 
     def close
@@ -69,6 +70,18 @@ module Wumble
       packet = Protobuf.string(1, @username) + Protobuf.string(2, @password)
       packet += Protobuf.field(5, 1_u64) # Opus
       send_packet(AUTHENTICATE, packet)
+    end
+
+    private def ping_loop
+      until @closed
+        sleep 5.seconds
+        break if @closed
+        # Murmur drops idle TCP control connections. Its Ping message uses a
+        # millisecond timestamp in protobuf field 1.
+        send_packet(PING, Protobuf.field(1, Time.utc.to_unix_ms.to_u64))
+      end
+    rescue ex
+      STDERR.puts "Mumble ping failed: #{ex.message || ex.class.name}" unless @closed
     end
 
     private def send_packet(type : Int32, payload : Bytes)
