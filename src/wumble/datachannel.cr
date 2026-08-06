@@ -182,7 +182,6 @@ module Wumble
 
     private def forward_browser_opus(opus : Bytes)
       @browser_packets += 1
-      STDERR.puts "WebRTC: forwarding browser Opus packets to Mumble" if @browser_packets == 1
       @on_opus.try &.call(opus, @browser_frame_number)
       @browser_frame_number += opus_duration_samples(opus) // 480_u32
     end
