@@ -19,10 +19,12 @@ async function logMediaStats() {
     const codecs = new Map();
     const transports = new Map();
     const inbound = [];
+    const outbound = [];
     reports.forEach((report) => {
       if (report.type === 'codec') codecs.set(report.id, report);
       else if (report.type === 'transport') transports.set(report.id, report);
       else if (report.type === 'inbound-rtp' && (report.kind === 'audio' || report.mediaType === 'audio')) inbound.push(report);
+      else if (report.type === 'outbound-rtp' && (report.kind === 'audio' || report.mediaType === 'audio')) outbound.push(report);
     });
     browserLog('WebRTC audio stats', {
       connection: peer.connectionState,
@@ -46,6 +48,12 @@ async function logMediaStats() {
           clockRate: codec?.clockRate ?? null,
         };
       }),
+      outbound: outbound.map((report) => ({
+        ssrc: report.ssrc,
+        packets: report.packetsSent,
+        bytes: report.bytesSent,
+        codec: codecs.get(report.codecId)?.mimeType ?? null,
+      })),
       transports: [...transports.values()].map((report) => ({
         state: report.dtlsState,
         selectedCandidatePairId: report.selectedCandidatePairId ?? null,
@@ -106,14 +114,14 @@ function stopMicrophone() {
 
 async function makeOffer(speakerCount = 1) {
   peer = new RTCPeerConnection({ iceServers: [] });
-  // The answerer maps one sendonly Mumble speaker track to each of these
-  // recvonly media sections; none of the speaker audio is combined.
-  for (let index = 0; index < Math.max(1, speakerCount); index += 1) {
+  // Use the first speaker m= section in both directions. libdatachannel only
+  // answers the offered sections it can pair with a local track; a separate
+  // microphone section would therefore be rejected as inactive. The two
+  // directions still retain independent RTP streams and Opus packets.
+  peer.addTransceiver(microphoneStream.getAudioTracks()[0], { direction: 'sendrecv' });
+  for (let index = 1; index < Math.max(1, speakerCount); index += 1) {
     peer.addTransceiver('audio', { direction: 'recvonly' });
   }
-  // This creates a separate sendonly m= section. The gateway forwards its
-  // Opus RTP payloads directly to Mumble; it is never mixed with speakers.
-  peer.addTrack(microphoneStream.getAudioTracks()[0], microphoneStream);
   peer.onicecandidate = ({ candidate }) => {
     if (candidate) {
       browserLog('local ICE candidate', { mid: candidate.sdpMid, type: candidate.type, protocol: candidate.protocol });
