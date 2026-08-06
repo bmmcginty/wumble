@@ -183,9 +183,12 @@ module Wumble
     end
 
     private def receive_tunnel(packet : Bytes)
-      # TCP UDPTunnel payloads are normally plaintext UDPVoice packets. Some
-      # deployments tunnel an encrypted datagram instead, so only decrypt when
-      # it does not already have the UDPVoiceOpus type nibble.
+      # Mumble 1.5 uses a one-byte UDP message type followed by a protobuf
+      # MumbleUDP.Audio message. It is plaintext inside the TCP tunnel.
+      return receive_protobuf_audio(packet[1..]) if !packet.empty? && packet[0] == 0_u8
+
+      # Older servers use the legacy UDPVoice packet. Some deployments tunnel
+      # an encrypted datagram instead, so only decrypt when it is not legacy Opus.
       unless !packet.empty? && (packet[0] >> 5) == 4
         plaintext = @crypt.try &.decrypt(packet)
         if !plaintext && (alternate = @alternate_crypt.try &.decrypt(packet))
@@ -210,6 +213,23 @@ module Wumble
       opus = packet[offset...finish]
       STDERR.puts "Mumble: forwarding #{opus.size}-byte Opus packet from session #{session}"
       @on_voice.try &.call(session.to_u32, opus)
+    end
+
+    private def receive_protobuf_audio(payload : Bytes)
+      session = nil.as(UInt32?)
+      opus = nil.as(Bytes?)
+      Protobuf.fields(payload) do |number, wire, value|
+        case number
+        when 3
+          sender, _offset = Protobuf.read_varint(value, 0)
+          session = sender.to_u32 if wire == 0 && sender <= UInt32::MAX
+        when 5
+          opus = value if wire == 2
+        end
+      end
+      return unless session && opus
+      STDERR.puts "Mumble: forwarding #{opus.not_nil!.size}-byte protobuf Opus packet from session #{session}"
+      @on_voice.try &.call(session.not_nil!, opus.not_nil!)
     end
   end
 end
