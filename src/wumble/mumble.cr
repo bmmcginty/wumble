@@ -179,14 +179,17 @@ module Wumble
     end
 
     private def receive_tunnel(packet : Bytes)
-      # UDPTunnel carries the normal encrypted UDP datagram. Decrypt it before
-      # extracting the Opus frame, but never decode or mix that frame.
-      plaintext = @crypt.try &.decrypt(packet)
-      unless plaintext
-        STDERR.puts "Mumble: discarded UDPTunnel packet (crypt authentication or sequence check failed)" if ENV["WUMBLE_DEBUG"]? == "1"
-        return
+      # TCP UDPTunnel payloads are normally plaintext UDPVoice packets. Some
+      # deployments tunnel an encrypted datagram instead, so only decrypt when
+      # it does not already have the UDPVoiceOpus type nibble.
+      unless !packet.empty? && (packet[0] >> 5) == 4
+        plaintext = @crypt.try &.decrypt(packet)
+        unless plaintext
+          STDERR.puts "Mumble: discarded UDPTunnel packet (not plaintext Opus and crypt authentication failed)"
+          return
+        end
+        packet = plaintext
       end
-      packet = plaintext
       return if packet.empty? || (packet[0] >> 5) != 4 # UDPVoiceOpus
       offset = 1
       session, offset = Protobuf.read_varint(packet, offset)

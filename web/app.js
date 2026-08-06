@@ -11,9 +11,15 @@ function browserLog(event, details = {}) {
   console.info(`Wumble: ${event}`, details);
   if (socket?.readyState === WebSocket.OPEN) signal({ type: 'log', event, details });
 }
+const nativeConsoleError = console.error.bind(console);
+console.error = (...values) => {
+  nativeConsoleError(...values);
+  const message = values.map((value) => value instanceof Error ? (value.stack || value.message) : String(value)).join(' ');
+  browserLog('console.error', { message });
+};
 function browserError(event, details = {}) {
+  // The console.error wrapper forwards this to the gateway log stream.
   console.error(`Wumble: ${event}`, details);
-  browserLog(event, details);
 }
 window.addEventListener('error', ({ message, filename, lineno, colno }) => {
   browserError('window error', { message, filename, lineno, colno });
