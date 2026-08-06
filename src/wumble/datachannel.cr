@@ -35,6 +35,8 @@ lib LibDataChannel
   fun rtc_get_remote_address = rtcGetRemoteAddress(pc : Handle, buffer : UInt8*, size : Int32) : Int32
   fun rtc_get_selected_candidate_pair = rtcGetSelectedCandidatePair(pc : Handle, local : UInt8*, local_size : Int32, remote : UInt8*, remote_size : Int32) : Int32
   fun wumble_receiver_start = wumble_receiver_start(pc : Handle) : Int32
+  fun wumble_receiver_received = wumble_receiver_received(pc : Handle) : UInt64
+  fun wumble_receiver_queued = wumble_receiver_queued(pc : Handle) : UInt64
   fun wumble_receiver_stop = wumble_receiver_stop(pc : Handle)
   fun rtc_add_track = rtcAddTrack(pc : Handle, sdp : UInt8*) : Handle
   fun rtc_send_message = rtcSendMessage(track : Handle, data : UInt8*, size : Int32) : Int32
@@ -69,6 +71,7 @@ module Wumble
       # its defaults; passing NULL segfaults in libdatachannel 0.24.
       config = LibDataChannel::Configuration.new
       @browser_frame_number = 0_u32
+      @browser_packets = 0_u64
       @closed = false
       @pc = LibDataChannel.rtc_create_peer_connection(pointerof(config))
       raise "rtcCreatePeerConnection failed" if @pc < 0
@@ -171,6 +174,8 @@ module Wumble
     end
 
     private def forward_browser_opus(opus : Bytes)
+      @browser_packets += 1
+      STDERR.puts "WebRTC: forwarding browser Opus packets to Mumble" if @browser_packets == 1
       @on_opus.try &.call(opus, @browser_frame_number)
       @browser_frame_number += opus_duration_samples(opus) // 480_u32
     end
@@ -232,7 +237,12 @@ module Wumble
       # Opus as 111, while Firefox commonly uses 109; answering with a new
       # payload type makes Firefox discard otherwise valid SRTP packets.
       payload_type = @opus_payload_types[mid]? || raise "offer has no Opus payload type for audio mid #{mid}"
-      sdp = "m=audio 9 UDP/TLS/RTP/SAVPF #{payload_type}\r\na=mid:#{mid}\r\na=sendonly\r\na=rtpmap:#{payload_type} opus/48000/2\r\na=fmtp:#{payload_type} minptime=10;useinbandfec=1\r\na=ssrc:#{session} cname:wumble-#{session}\r\n"
+      # The browser offers its microphone on m=0. Make that paired track
+      # sendrecv so the answer authorizes browser-to-gateway RTP as well as
+      # gateway-to-browser speaker audio; the remaining speaker tracks are
+      # receive-only in the browser and stay sendonly here.
+      direction = mid == "0" ? "sendrecv" : "sendonly"
+      sdp = "m=audio 9 UDP/TLS/RTP/SAVPF #{payload_type}\r\na=mid:#{mid}\r\na=#{direction}\r\na=rtpmap:#{payload_type} opus/48000/2\r\na=fmtp:#{payload_type} minptime=10;useinbandfec=1\r\na=ssrc:#{session} cname:wumble-#{session}\r\n"
       track = LibDataChannel.rtc_add_track(@pc, sdp.to_unsafe)
       raise "rtcAddTrack failed (#{track})" if track < 0
       STDERR.puts "WebRTC: added Opus track session=#{session} mid=#{mid} track=#{track} ssrc=#{session} payload_type=#{payload_type} mid_extension=#{@mid_extension_ids[mid]?}" if debug?
@@ -301,7 +311,7 @@ module Wumble
       tracks = @tracks.map do |session, track|
         "session=#{session} track=#{track} open=#{LibDataChannel.rtc_is_open(track)} samples=#{@sent_packets[session]} bytes=#{@sent_bytes[session]} dropped=#{@dropped_packets[session]} buffered=#{LibDataChannel.rtc_get_buffered_amount(track)}"
       end
-      STDERR.puts "WebRTC debug: local=#{local_address} remote=#{remote_address} candidate_pair=#{pair}; #{tracks.join("; ")}"
+      STDERR.puts "WebRTC debug: local=#{local_address} remote=#{remote_address} candidate_pair=#{pair} browser_received=#{LibDataChannel.wumble_receiver_received(@pc)} browser_queued=#{LibDataChannel.wumble_receiver_queued(@pc)} browser_forwarded=#{@browser_packets}; #{tracks.join("; ")}"
     end
 
     private def rtc_address(&)

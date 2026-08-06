@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -17,12 +18,15 @@ typedef struct {
     int read_fd;
     int write_fd;
     pthread_mutex_t lock;
+    _Atomic uint64_t received;
+    _Atomic uint64_t queued;
 } wumble_receiver;
 
 static void on_message(int track, const char *message, int size, void *ptr) {
     (void)track;
     wumble_receiver *receiver = ptr;
     if (!receiver || size <= 0 || size > 4093) return;
+    atomic_fetch_add(&receiver->received, 1);
 
     uint16_t length = htons((uint16_t)size);
     struct iovec parts[] = {
@@ -31,7 +35,9 @@ static void on_message(int track, const char *message, int size, void *ptr) {
     };
 
     pthread_mutex_lock(&receiver->lock);
-    if (receiver->write_fd >= 0) writev(receiver->write_fd, parts, 2);
+    if (receiver->write_fd >= 0 && writev(receiver->write_fd, parts, 2) == size + 2) {
+        atomic_fetch_add(&receiver->queued, 1);
+    }
     pthread_mutex_unlock(&receiver->lock);
 }
 
@@ -63,6 +69,16 @@ int wumble_receiver_start(int pc) {
         return -1;
     }
     return receiver->read_fd;
+}
+
+uint64_t wumble_receiver_received(int pc) {
+    wumble_receiver *receiver = rtcGetUserPointer(pc);
+    return receiver ? atomic_load(&receiver->received) : 0;
+}
+
+uint64_t wumble_receiver_queued(int pc) {
+    wumble_receiver *receiver = rtcGetUserPointer(pc);
+    return receiver ? atomic_load(&receiver->queued) : 0;
 }
 
 void wumble_receiver_stop(int pc) {

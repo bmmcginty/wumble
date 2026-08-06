@@ -34,6 +34,7 @@ module Wumble
       @udp = nil.as(UDPSocket?)
       @closed = false
       @udp_unavailable = false
+      @browser_packets = 0_u64
     end
 
     def on_voice(&block : UInt32, Bytes, UInt32? ->)
@@ -81,6 +82,8 @@ module Wumble
       return unless udp = @udp
       payload = Bytes[0_u8] + Protobuf.field(4, frame_number.to_u64) + Protobuf.bytes(5, opus)
       udp.send(crypt.encrypt(payload))
+      @browser_packets += 1
+      STDERR.puts "Mumble: sending browser Opus to Mumble" if @browser_packets == 1
       STDERR.puts "Mumble: sent #{opus.size}-byte browser Opus packet frame=#{frame_number}" if ENV["WUMBLE_DEBUG"]? == "1"
     rescue ex
       STDERR.puts "Mumble UDP voice send failed: #{ex.message || ex.class.name}" unless @closed
