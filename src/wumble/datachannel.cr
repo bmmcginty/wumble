@@ -77,6 +77,9 @@ module Wumble
       @browser_fallback_frame_number = 0_u32
       @browser_first_rtp_timestamp = nil.as(UInt32?)
       @browser_packets = 0_u64
+      @browser_pipe_delay_packets = 0_u64
+      @browser_pipe_delay_total_ms = 0_u64
+      @browser_pipe_delay_max_ms = 0_u32
       @closed = false
       @pc = LibDataChannel.rtc_create_peer_connection(pointerof(config))
       raise "rtcCreatePeerConnection failed" if @pc < 0
@@ -177,7 +180,11 @@ module Wumble
         sleep 5.seconds
         break if @closed
         next unless debug?
-        STDERR.puts "WebRTC browser receiver: received=#{LibDataChannel.wumble_receiver_received(@pc)} queued=#{LibDataChannel.wumble_receiver_queued(@pc)} forwarded=#{@browser_packets}"
+        delay_average = @browser_pipe_delay_packets > 0 ? @browser_pipe_delay_total_ms // @browser_pipe_delay_packets : 0_u64
+        STDERR.puts "WebRTC browser receiver: received=#{LibDataChannel.wumble_receiver_received(@pc)} queued=#{LibDataChannel.wumble_receiver_queued(@pc)} forwarded=#{@browser_packets} pipe_delay_ms_avg=#{delay_average} max=#{@browser_pipe_delay_max_ms} samples=#{@browser_pipe_delay_packets}"
+        @browser_pipe_delay_packets = 0_u64
+        @browser_pipe_delay_total_ms = 0_u64
+        @browser_pipe_delay_max_ms = 0_u32
       end
     end
 
@@ -189,16 +196,17 @@ module Wumble
         if count > 0
           buffer[0, count.to_i].each { |byte| pending << byte }
           offset = 0
-          while pending.size - offset >= 2
+          while pending.size - offset >= 6
             size = (pending[offset].to_i << 8) | pending[offset + 1].to_i
-            raise "invalid browser audio packet size" if size == 0 || size > 4093
-            break if pending.size - offset < size + 2
-            packet = Bytes.new(size) { |index| pending[offset + 2 + index] }
+            raise "invalid browser audio packet size" if size == 0 || size > 4090
+            break if pending.size - offset < size + 6
+            enqueued_at = IO::ByteFormat::BigEndian.decode(UInt32, Bytes[pending[offset + 2], pending[offset + 3], pending[offset + 4], pending[offset + 5]])
+            packet = Bytes.new(size) { |index| pending[offset + 6 + index] }
             if audio = opus_payload(packet)
               opus, rtp_timestamp = audio
-              forward_browser_opus(opus, rtp_timestamp) unless opus.empty?
+              forward_browser_opus(opus, rtp_timestamp, enqueued_at) unless opus.empty?
             end
-            offset += size + 2
+            offset += size + 6
           end
           pending = offset < pending.size ? pending[offset..] : [] of UInt8
         elsif count == 0
@@ -213,8 +221,12 @@ module Wumble
       STDERR.puts "WebRTC browser audio receiver closed: #{ex.message || ex.class.name}" unless @closed
     end
 
-    private def forward_browser_opus(opus : Bytes, rtp_timestamp : UInt32?)
+    private def forward_browser_opus(opus : Bytes, rtp_timestamp : UInt32?, enqueued_at : UInt32)
       @browser_packets += 1
+      pipe_delay = (Time.utc.to_unix_ms.to_u64 & 0xffff_ffff_u64).to_u32 &- enqueued_at
+      @browser_pipe_delay_packets += 1
+      @browser_pipe_delay_total_ms += pipe_delay
+      @browser_pipe_delay_max_ms = pipe_delay if pipe_delay > @browser_pipe_delay_max_ms
       frame_number = browser_frame_number(rtp_timestamp, opus)
       @on_opus.try &.call(opus, frame_number)
     end

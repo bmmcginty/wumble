@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <time.h>
 #include <stdlib.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -25,17 +26,23 @@ typedef struct {
 static void on_message(int track, const char *message, int size, void *ptr) {
     (void)track;
     wumble_receiver *receiver = ptr;
-    if (!receiver || size <= 0 || size > 4093) return;
+    /* Keep the entire record within PIPE_BUF so concurrent callback writes are
+     * atomic. The timestamp lets Crystal measure native-callback-to-forward
+     * delay rather than merely counting queued packets. */
+    if (!receiver || size <= 0 || size > 4090) return;
     atomic_fetch_add(&receiver->received, 1);
-
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
     uint16_t length = htons((uint16_t)size);
+    uint32_t timestamp_ms = htonl((uint32_t)((uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000));
     struct iovec parts[] = {
         { .iov_base = &length, .iov_len = sizeof(length) },
+        { .iov_base = &timestamp_ms, .iov_len = sizeof(timestamp_ms) },
         { .iov_base = (void *)message, .iov_len = (size_t)size },
     };
 
     pthread_mutex_lock(&receiver->lock);
-    if (receiver->write_fd >= 0 && writev(receiver->write_fd, parts, 2) == size + 2) {
+    if (receiver->write_fd >= 0 && writev(receiver->write_fd, parts, 3) == size + 6) {
         atomic_fetch_add(&receiver->queued, 1);
     }
     pthread_mutex_unlock(&receiver->lock);

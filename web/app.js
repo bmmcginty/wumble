@@ -72,6 +72,8 @@ async function logMediaStats() {
           totalSamplesDuration: metric(report.totalSamplesDuration),
           jitterBufferDelay: metric(report.jitterBufferDelay),
           jitterBufferEmittedCount: report.jitterBufferEmittedCount ?? null,
+          jitterBufferMeanDelay: report.jitterBufferEmittedCount > 0 ? metric(report.jitterBufferDelay / report.jitterBufferEmittedCount) : null,
+          jitterBufferTargetDelay: metric(report.jitterBufferTargetDelay),
           concealedSamples: report.concealedSamples ?? null,
           concealmentEvents: report.concealmentEvents ?? null,
           codec: codec?.mimeType ?? null,
