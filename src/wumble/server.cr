@@ -33,15 +33,20 @@ module Wumble
           message_type = data["type"].as_s
           STDERR.puts "WebRTC signalling: received #{message_type}"
           case message_type
+          when "ping"
+            socket.send({type: "pong"}.to_json)
           when "connect"
             raise "already connected" if peer
             request = ConnectRequest.from_json(data["options"].to_json)
             validate(request)
             peer = Peer.new
             mumble = MumbleConnection.new(request.server, request.port, request.username, request.password)
+            mumble.not_nil!.on_user { |speaker, _name| peer.not_nil!.prepare_speaker(speaker) }
             mumble.not_nil!.on_voice { |speaker, opus| peer.not_nil!.send_opus(speaker, opus) }
+            # Wait for UserState packets before asking the browser for an offer:
+            # the answer then advertises a separate track for every speaker.
+            mumble.not_nil!.on_ready { socket.send({type: "connected"}.to_json) }
             mumble.not_nil!.connect
-            socket.send({type: "connected"}.to_json)
           when "offer"
             raise "connect before sending an offer" unless peer
             current_peer = peer.not_nil!

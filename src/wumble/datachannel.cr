@@ -54,6 +54,12 @@ module Wumble
       check LibDataChannel.rtc_add_remote_candidate(@pc, candidate.to_unsafe, mid.to_unsafe)
     end
 
+    # Register known Mumble sessions before answering the browser offer so its
+    # SDP has one media section for each existing speaker.
+    def prepare_speaker(session : UInt32)
+      @tracks[session]? || add_speaker_track(session)
+    end
+
     # Do not use libdatachannel's callbacks here. They run on its native C++
     # thread, which cannot enter Crystal's GC/runtime. Polling from the Crystal
     # signalling fiber keeps all WebSocket and GC work on Crystal-managed threads.
@@ -68,7 +74,7 @@ module Wumble
     # One sendonly RTP track is created for every Mumble session. This is the
     # important boundary: no decoder, mixer, or shared browser MediaStream exists.
     def send_opus(session : UInt32, opus : Bytes)
-      track = @tracks[session]? || add_speaker_track(session)
+      track = prepare_speaker(session)
       sequence = @sequence[session] += 1
       timestamp = @timestamp[session] += 960 # 20 ms at Opus' 48 kHz RTP clock
       rtp = Bytes.new(12 + opus.size)

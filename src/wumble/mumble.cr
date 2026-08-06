@@ -1,6 +1,7 @@
 require "socket"
 require "openssl"
 require "./protobuf"
+require "./crypt_state"
 
 module Wumble
   # Mumble's TCP control protocol. Voice is intentionally accepted separately by
@@ -13,16 +14,28 @@ module Wumble
     REJECT        =  4
     SERVER_SYNC   =  5
     USER_STATE    =  9
+    CRYPT_SETUP   = 15
     CODEC_VERSION = 21
 
     getter users = Hash(UInt32, String).new
     getter on_voice : Proc(UInt32, Bytes, Nil)?
+    getter on_user : Proc(UInt32, String, Nil)?
+    getter on_ready : Proc(Nil)?
 
     def initialize(@host : String, @port : Int32, @username : String, @password : String)
+      @crypt = nil.as(CryptState?)
     end
 
     def on_voice(&block : UInt32, Bytes ->)
       @on_voice = block
+    end
+
+    def on_user(&block : UInt32, String ->)
+      @on_user = block
+    end
+
+    def on_ready(&block : ->)
+      @on_ready = block
     end
 
     def connect
@@ -78,9 +91,12 @@ module Wumble
         io.read_fully(payload)
         STDERR.puts "Mumble: received #{packet_name(type)} (#{payload.size} bytes)" unless type == UDPTUNNEL
         case type
-        when REJECT      then reject(payload)
-        when SERVER_SYNC then STDERR.puts "Mumble: authenticated and synchronized"
+        when REJECT then reject(payload)
+        when SERVER_SYNC
+          STDERR.puts "Mumble: authenticated and synchronized"
+          @on_ready.try &.call
         when USER_STATE  then update_user(payload)
+        when CRYPT_SETUP then configure_crypt(payload)
         when UDPTUNNEL   then receive_tunnel(payload)
         end
       end
@@ -97,6 +113,23 @@ module Wumble
       raise "Mumble rejected authentication#{reason ? ": #{reason}" : ""}"
     end
 
+    private def configure_crypt(payload : Bytes)
+      key = nil.as(Bytes?)
+      client_nonce = nil.as(Bytes?)
+      server_nonce = nil.as(Bytes?)
+      Protobuf.fields(payload) do |number, wire, value|
+        next unless wire == 2
+        case number
+        when 1 then key = value
+        when 2 then client_nonce = value
+        when 3 then server_nonce = value
+        end
+      end
+      return STDERR.puts "Mumble: incomplete CryptSetup; waiting for full key material" unless key && client_nonce && server_nonce
+      @crypt = CryptState.new(key.not_nil!, client_nonce.not_nil!, server_nonce.not_nil!)
+      STDERR.puts "Mumble: CryptSetup complete; encrypted voice packets can be decrypted"
+    end
+
     private def update_user(payload : Bytes)
       session = nil
       name = nil
@@ -106,7 +139,10 @@ module Wumble
         when 3 then name = String.new(value) if wire == 2
         end
       end
-      @users[session.not_nil!] = name.not_nil! if session && name
+      if session && name
+        @users[session.not_nil!] = name.not_nil!
+        @on_user.try &.call(session.not_nil!, name.not_nil!)
+      end
     end
 
     private def packet_name(type : Int32)
@@ -118,14 +154,18 @@ module Wumble
       when REJECT        then "Reject"
       when SERVER_SYNC   then "ServerSync"
       when USER_STATE    then "UserState"
+      when CRYPT_SETUP   then "CryptSetup"
       when CODEC_VERSION then "CodecVersion"
       else                    "control type #{type}"
       end
     end
 
     private def receive_tunnel(packet : Bytes)
-      # UDP tunnel payloads have the normal Mumble voice packet layout. The
-      # packet contains one Opus payload; preserve it rather than decoding/mixing.
+      # UDPTunnel carries the normal encrypted UDP datagram. Decrypt it before
+      # extracting the Opus frame, but never decode or mix that frame.
+      plaintext = @crypt.try &.decrypt(packet)
+      return unless plaintext
+      packet = plaintext
       return if packet.empty? || (packet[0] >> 5) != 4 # UDPVoiceOpus
       offset = 1
       session, offset = Protobuf.read_varint(packet, offset)

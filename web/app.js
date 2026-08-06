@@ -3,6 +3,7 @@ const status = document.querySelector('#status');
 const speakers = document.querySelector('#speakers');
 let socket;
 let peer;
+let heartbeat;
 
 function setStatus(text) { status.textContent = text; }
 function signal(message) { socket.send(JSON.stringify(message)); }
@@ -41,10 +42,14 @@ form.addEventListener('submit', (event) => {
   socket.onopen = () => {
     setStatus('Connecting to Mumble…');
     signal({ type: 'connect', options });
+    // Keep reverse proxies from expiring an otherwise idle signalling socket.
+    heartbeat = window.setInterval(() => signal({ type: 'ping' }), 20_000);
   };
   socket.onmessage = async ({ data }) => {
     const message = JSON.parse(data);
-    if (message.type === 'connected') {
+    if (message.type === 'pong') {
+      return;
+    } else if (message.type === 'connected') {
       await makeOffer();
     } else if (message.type === 'answer') {
       await peer.setRemoteDescription({ type: message.description_type, sdp: message.sdp });
@@ -58,6 +63,7 @@ form.addEventListener('submit', (event) => {
   };
   socket.onerror = () => console.error('Wumble signalling WebSocket error');
   socket.onclose = ({ code, reason }) => {
+    window.clearInterval(heartbeat);
     console.info(`Wumble signalling WebSocket closed (${code}: ${reason || 'no reason'})`);
     setStatus(`Disconnected (${code})`);
   };
