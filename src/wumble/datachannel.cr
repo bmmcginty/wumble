@@ -71,7 +71,8 @@ module Wumble
       # libdatachannel requires a real (zero-initialized) configuration to use
       # its defaults; passing NULL segfaults in libdatachannel 0.24.
       config = LibDataChannel::Configuration.new
-      @browser_frame_number = 0_u32
+      @browser_fallback_frame_number = 0_u32
+      @browser_first_rtp_timestamp = nil.as(UInt32?)
       @browser_packets = 0_u64
       @closed = false
       @pc = LibDataChannel.rtc_create_peer_connection(pointerof(config))
@@ -172,24 +173,40 @@ module Wumble
         raise "invalid browser audio packet size" if size == 0 || size > 4093
         packet = Bytes.new(size)
         @receiver.read_fully(packet)
-        if opus = opus_payload(packet)
-          forward_browser_opus(opus) unless opus.empty?
+        if audio = opus_payload(packet)
+          opus, rtp_timestamp = audio
+          forward_browser_opus(opus, rtp_timestamp) unless opus.empty?
         end
       end
     rescue ex
       STDERR.puts "WebRTC browser audio receiver closed: #{ex.message || ex.class.name}" unless @closed
     end
 
-    private def forward_browser_opus(opus : Bytes)
+    private def forward_browser_opus(opus : Bytes, rtp_timestamp : UInt32?)
       @browser_packets += 1
-      @on_opus.try &.call(opus, @browser_frame_number)
-      @browser_frame_number += opus_duration_samples(opus) // 480_u32
+      frame_number = browser_frame_number(rtp_timestamp, opus)
+      @on_opus.try &.call(opus, frame_number)
     end
 
-    private def opus_payload(packet : Bytes) : Bytes?
+    # Preserve gaps in the browser RTP clock when encoding Mumble's 10 ms
+    # frame number. Advancing a synthetic counter only for packets that reach
+    # this bridge hides WebRTC loss from Mumble and makes its decoder join the
+    # samples on either side of the loss, causing an audible click.
+    private def browser_frame_number(rtp_timestamp : UInt32?, opus : Bytes) : UInt32
+      if timestamp = rtp_timestamp
+        first = @browser_first_rtp_timestamp ||= timestamp
+        return (timestamp &- first) // 480_u32
+      end
+      frame_number = @browser_fallback_frame_number
+      @browser_fallback_frame_number &+= opus_duration_samples(opus) // 480_u32
+      frame_number
+    end
+
+    private def opus_payload(packet : Bytes) : Tuple(Bytes, UInt32?)?
       # A track message is normally an RTP packet. Keep the raw-payload path
       # for libdatachannel versions configured with an Opus depacketizer.
-      return packet unless packet.size >= 12 && (packet[0] >> 6) == 2
+      return {packet, nil} unless packet.size >= 12 && (packet[0] >> 6) == 2
+      timestamp = IO::ByteFormat::BigEndian.decode(UInt32, packet[4, 4])
       offset = 12 + (packet[0] & 0x0f) * 4
       return nil if offset > packet.size
       if packet[0] & 0x10 != 0
@@ -199,7 +216,7 @@ module Wumble
       end
       padding = packet[0] & 0x20 != 0 ? packet[-1].to_i : 0
       return nil if padding > packet.size - offset
-      packet[offset, packet.size - offset - padding]
+      {packet[offset, packet.size - offset - padding], timestamp}
     end
 
     private def forward_opus(session : UInt32, track : LibDataChannel::Handle, opus : Bytes, frame_number : UInt32?)
