@@ -166,7 +166,8 @@ async function attemptRenegotiation() {
 async function makeOffer(speakerCount = 1) {
   renegotiationRequested = false;
   renegotiationInProgress = false;
-  peer = new RTCPeerConnection({ iceServers: [] });
+  const currentPeer = new RTCPeerConnection({ iceServers: [] });
+  peer = currentPeer;
   // Use the first speaker m= section in both directions. libdatachannel only
   // answers the offered sections it can pair with a local track; a separate
   // microphone section would therefore be rejected as inactive. The two
@@ -175,7 +176,8 @@ async function makeOffer(speakerCount = 1) {
   for (let index = 1; index < Math.max(1, speakerCount); index += 1) {
     peer.addTransceiver('audio', { direction: 'recvonly' });
   }
-  peer.onicecandidate = ({ candidate }) => {
+  currentPeer.onicecandidate = ({ candidate }) => {
+    if (peer !== currentPeer) return;
     if (candidate) {
       browserLog('local ICE candidate', { mid: candidate.sdpMid, type: candidate.type, protocol: candidate.protocol });
       signal({ type: 'candidate', candidate: candidate.candidate, mid: candidate.sdpMid });
@@ -183,29 +185,33 @@ async function makeOffer(speakerCount = 1) {
       browserLog('local ICE gathering complete');
     }
   };
-  peer.onconnectionstatechange = () => {
-    browserLog('peer connection state', { state: peer.connectionState });
-    if (peer.connectionState === 'connected') {
+  currentPeer.onconnectionstatechange = () => {
+    if (peer !== currentPeer) return;
+    browserLog('peer connection state', { state: currentPeer.connectionState });
+    if (currentPeer.connectionState === 'connected') {
       startMediaStats();
-    } else if (peer.connectionState === 'disconnected' || peer.connectionState === 'failed') {
+    } else if (currentPeer.connectionState === 'disconnected' || currentPeer.connectionState === 'failed') {
       socket?.close();
     }
   };
-  peer.oniceconnectionstatechange = () => {
-    const details = { state: peer.iceConnectionState };
-    if (peer.iceConnectionState === 'failed') {
+  currentPeer.oniceconnectionstatechange = () => {
+    if (peer !== currentPeer) return;
+    const details = { state: currentPeer.iceConnectionState };
+    if (currentPeer.iceConnectionState === 'failed') {
       browserError('ICE failed', details);
       socket?.close();
     } else browserLog('ICE connection state', details);
   };
-  peer.onicecandidateerror = ({ url, errorCode, errorText }) => {
-    browserError('ICE candidate error', { url, errorCode, errorText });
+  currentPeer.onicecandidateerror = ({ url, errorCode, errorText }) => {
+    if (peer === currentPeer) browserError('ICE candidate error', { url, errorCode, errorText });
   };
-  peer.onsignalingstatechange = () => {
-    browserLog('signalling state', { state: peer.signalingState });
+  currentPeer.onsignalingstatechange = () => {
+    if (peer !== currentPeer) return;
+    browserLog('signalling state', { state: currentPeer.signalingState });
     void attemptRenegotiation();
   };
-  peer.ontrack = ({ track, streams, transceiver }) => {
+  currentPeer.ontrack = ({ track, streams, transceiver }) => {
+    if (peer !== currentPeer) return;
     const speaker = speakerInfoByMid.get(transceiver?.mid);
     const label = speaker ? `${speaker.name} (session ${speaker.session})` : 'Unknown speaker';
     browserLog('received remote track', { id: track.id, kind: track.kind, streams: streams.length, mid: transceiver?.mid, speaker });
