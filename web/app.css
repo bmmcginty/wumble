@@ -7,4 +7,4 @@ button { background: #3182ce; color: white; border: 0; cursor: pointer; }
 #speakers { display: grid; gap: .5rem; }
 #speakers article { border: 1px solid #718096; border-radius: .3rem; padding: .6rem; }
 #speakers h2 { font-size: 1rem; margin: 0 0 .4rem; }
-audio { width: 100%; }
+audio { display: none; }
