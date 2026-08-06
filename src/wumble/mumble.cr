@@ -24,6 +24,7 @@ module Wumble
 
     def initialize(@host : String, @port : Int32, @username : String, @password : String)
       @crypt = nil.as(CryptState?)
+      @alternate_crypt = nil.as(CryptState?)
       @closed = false
     end
 
@@ -144,6 +145,9 @@ module Wumble
       end
       return STDERR.puts "Mumble: incomplete CryptSetup; waiting for full key material" unless key && client_nonce && server_nonce
       @crypt = CryptState.new(key.not_nil!, client_nonce.not_nil!, server_nonce.not_nil!)
+      # Some Murmur versions label nonce directions from the server's point of
+      # view. Keep a tag-authenticated alternate state for that wire variant.
+      @alternate_crypt = CryptState.new(key.not_nil!, server_nonce.not_nil!, client_nonce.not_nil!)
       STDERR.puts "Mumble: CryptSetup complete; encrypted voice packets can be decrypted"
     end
 
@@ -184,6 +188,10 @@ module Wumble
       # it does not already have the UDPVoiceOpus type nibble.
       unless !packet.empty? && (packet[0] >> 5) == 4
         plaintext = @crypt.try &.decrypt(packet)
+        if !plaintext && (alternate = @alternate_crypt.try &.decrypt(packet))
+          STDERR.puts "Mumble: decrypted UDPTunnel using alternate nonce direction"
+          plaintext = alternate
+        end
         unless plaintext
           STDERR.puts "Mumble: discarded UDPTunnel packet (not plaintext Opus and crypt authentication failed)"
           return
