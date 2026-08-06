@@ -56,5 +56,9 @@ form.addEventListener('submit', (event) => {
       socket.close();
     }
   };
-  socket.onclose = () => setStatus('Disconnected');
+  socket.onerror = () => console.error('Wumble signalling WebSocket error');
+  socket.onclose = ({ code, reason }) => {
+    console.info(`Wumble signalling WebSocket closed (${code}: ${reason || 'no reason'})`);
+    setStatus(`Disconnected (${code})`);
+  };
 });

@@ -24,12 +24,15 @@ module Wumble
     end
 
     private def handle_socket(socket : HTTP::WebSocket)
+      STDERR.puts "WebRTC signalling: WebSocket opened"
       peer = nil.as(Peer?)
       mumble = nil.as(MumbleConnection?)
       socket.on_message do |message|
         begin
           data = JSON.parse(message)
-          case data["type"].as_s
+          message_type = data["type"].as_s
+          STDERR.puts "WebRTC signalling: received #{message_type}"
+          case message_type
           when "connect"
             raise "already connected" if peer
             request = ConnectRequest.from_json(data["options"].to_json)
@@ -43,13 +46,17 @@ module Wumble
             raise "connect before sending an offer" unless peer
             current_peer = peer.not_nil!
             current_peer.accept_offer(data["sdp"].as_s)
+            STDERR.puts "WebRTC signalling: accepted browser offer; waiting for local answer"
             spawn do
               begin
                 # Give ICE gathering time to add host candidates to the SDP.
                 sleep 1.second
                 answer = current_peer.local_description || raise "libdatachannel did not produce an answer"
                 socket.send({type: "answer", sdp: answer, description_type: "answer"}.to_json)
+                STDERR.puts "WebRTC signalling: sent answer (#{answer.bytesize} bytes)"
               rescue ex
+                STDERR.puts "WebRTC answer error: #{ex.message || ex.class.name}"
+                STDERR.puts ex.backtrace.join('\n') if ENV["WUMBLE_DEBUG"]? == "1"
                 socket.send({type: "error", message: ex.message || "failed to create WebRTC answer"}.to_json)
               end
             end
@@ -59,10 +66,13 @@ module Wumble
             raise "unknown signalling message"
           end
         rescue ex
+          STDERR.puts "WebRTC signalling error: #{ex.message || ex.class.name}"
+          STDERR.puts ex.backtrace.join('\n') if ENV["WUMBLE_DEBUG"]? == "1"
           socket.send({type: "error", message: ex.message || "connection failed"}.to_json)
         end
       end
-      socket.on_close do
+      socket.on_close do |code, reason|
+        STDERR.puts "WebRTC signalling: WebSocket closed (#{code}: #{reason.inspect}); closing Mumble connection"
         mumble.try &.close
         peer.try &.close
       end
