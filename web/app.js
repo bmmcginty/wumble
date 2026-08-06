@@ -4,6 +4,63 @@ const speakers = document.querySelector('#speakers');
 let socket;
 let peer;
 let heartbeat;
+let statsTimer;
+
+function metric(value) {
+  return typeof value === 'number' ? Math.round(value * 1000) / 1000 : null;
+}
+
+async function logMediaStats() {
+  if (!peer || peer.connectionState === 'closed') return;
+  try {
+    const reports = await peer.getStats();
+    const codecs = new Map();
+    const transports = new Map();
+    const inbound = [];
+    reports.forEach((report) => {
+      if (report.type === 'codec') codecs.set(report.id, report);
+      else if (report.type === 'transport') transports.set(report.id, report);
+      else if (report.type === 'inbound-rtp' && (report.kind === 'audio' || report.mediaType === 'audio')) inbound.push(report);
+    });
+    browserLog('WebRTC audio stats', {
+      connection: peer.connectionState,
+      ice: peer.iceConnectionState,
+      inbound: inbound.map((report) => {
+        const codec = codecs.get(report.codecId);
+        return {
+          ssrc: report.ssrc,
+          packets: report.packetsReceived,
+          bytes: report.bytesReceived,
+          lost: report.packetsLost,
+          jitter: metric(report.jitter),
+          audioLevel: metric(report.audioLevel),
+          totalAudioEnergy: metric(report.totalAudioEnergy),
+          totalSamplesDuration: metric(report.totalSamplesDuration),
+          jitterBufferDelay: metric(report.jitterBufferDelay),
+          jitterBufferEmittedCount: report.jitterBufferEmittedCount ?? null,
+          concealedSamples: report.concealedSamples ?? null,
+          concealmentEvents: report.concealmentEvents ?? null,
+          codec: codec?.mimeType ?? null,
+          clockRate: codec?.clockRate ?? null,
+        };
+      }),
+      transports: [...transports.values()].map((report) => ({
+        state: report.dtlsState,
+        selectedCandidatePairId: report.selectedCandidatePairId ?? null,
+        bytesReceived: report.bytesReceived,
+        bytesSent: report.bytesSent,
+      })),
+    });
+  } catch (error) {
+    browserError('WebRTC stats failed', { message: String(error) });
+  }
+}
+
+function startMediaStats() {
+  window.clearInterval(statsTimer);
+  logMediaStats();
+  statsTimer = window.setInterval(logMediaStats, 5_000);
+}
 
 function setStatus(text) { status.textContent = text; }
 function signal(message) { socket.send(JSON.stringify(message)); }
@@ -43,7 +100,10 @@ async function makeOffer(speakerCount = 1) {
       browserLog('local ICE gathering complete');
     }
   };
-  peer.onconnectionstatechange = () => browserLog('peer connection state', { state: peer.connectionState });
+  peer.onconnectionstatechange = () => {
+    browserLog('peer connection state', { state: peer.connectionState });
+    if (peer.connectionState === 'connected') startMediaStats();
+  };
   peer.oniceconnectionstatechange = () => {
     const details = { state: peer.iceConnectionState };
     if (peer.iceConnectionState === 'failed') browserError('ICE failed', details);
@@ -62,9 +122,12 @@ async function makeOffer(speakerCount = 1) {
     audio.controls = true;
     audio.srcObject = streams[0] || new MediaStream([track]);
     audio.dataset.trackId = track.id;
-    audio.onplaying = () => browserLog('speaker audio playing', { track: track.id });
+    audio.onplaying = () => browserLog('speaker audio playing', { track: track.id, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
+    audio.onwaiting = () => browserLog('speaker audio waiting', { track: track.id, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
     audio.onstalled = () => browserLog('speaker audio stalled', { track: track.id });
     audio.onerror = () => browserLog('speaker audio error', { track: track.id, error: audio.error?.message });
+    track.onmute = () => browserLog('remote track muted', { id: track.id });
+    track.onunmute = () => browserLog('remote track unmuted', { id: track.id });
     speakers.append(audio);
     track.onended = () => { browserLog('remote track ended', { id: track.id }); audio.remove(); };
   };
@@ -112,6 +175,7 @@ form.addEventListener('submit', (event) => {
   socket.onerror = () => browserLog('signalling WebSocket error');
   socket.onclose = ({ code, reason }) => {
     window.clearInterval(heartbeat);
+    window.clearInterval(statsTimer);
     console.info(`Wumble signalling WebSocket closed (${code}: ${reason || 'no reason'})`);
     setStatus(`Disconnected (${code})`);
   };
