@@ -1,6 +1,7 @@
 const form = document.querySelector('#connect');
 const status = document.querySelector('#status');
 const speakers = document.querySelector('#speakers');
+const connectionToggle = document.querySelector('#connection-toggle');
 let socket;
 let peer;
 let heartbeat;
@@ -12,6 +13,7 @@ let connectionOptions;
 let reconnectTimer;
 let reconnectAttempts = 0;
 let reconnectEnabled = false;
+let connectionActive = false;
 const speakerInfoByMid = new Map();
 const connectionFragmentFields = [
   { parameter: 'host', input: form.elements.namedItem('server') },
@@ -101,6 +103,10 @@ function startMediaStats() {
 }
 
 function setStatus(text) { status.textContent = text; }
+function setConnectionActive(active) {
+  connectionActive = active;
+  connectionToggle.textContent = active ? 'Disconnect' : 'Connect';
+}
 function signal(message) { socket.send(JSON.stringify(message)); }
 function browserLog(event, details = {}) {
   console.info(`Wumble: ${event}`, details);
@@ -288,6 +294,7 @@ function connectSignalling() {
       await peer.setRemoteDescription({ type: message.description_type, sdp: message.sdp });
       browserLog('accepted WebRTC answer', { sdpBytes: message.sdp.length });
       setStatus('Connected');
+      setConnectionActive(true);
       await attemptRenegotiation();
     } else if (message.type === 'renegotiate') {
       browserLog('gateway requested WebRTC renegotiation');
@@ -315,6 +322,7 @@ function connectSignalling() {
     peer?.close();
     peer = undefined;
     console.info(`Wumble signalling WebSocket closed (${code}: ${reason || 'no reason'})`);
+    setConnectionActive(false);
     if (reconnectEnabled) {
       scheduleReconnect();
     } else {
@@ -326,6 +334,20 @@ function connectSignalling() {
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
+  if (connectionActive) {
+    reconnectEnabled = false;
+    const activeSocket = socket;
+    socket = undefined;
+    activeSocket?.close();
+    peer?.close();
+    peer = undefined;
+    window.clearInterval(heartbeat);
+    window.clearInterval(statsTimer);
+    stopMicrophone();
+    setConnectionActive(false);
+    setStatus('Disconnected');
+    return;
+  }
   window.clearTimeout(reconnectTimer);
   reconnectTimer = undefined;
   reconnectEnabled = false;
