@@ -38,6 +38,7 @@ module Wumble
     getter pc : LibDataChannel::Handle
     @tracks = Hash(UInt32, LibDataChannel::Handle).new
     @speakers = Set(UInt32).new
+    @pending_audio = Hash(UInt32, Array(Bytes)).new { |sessions, session| sessions[session] = [] of Bytes }
     @remote_description_set = false
     @sequence = Hash(UInt32, UInt16).new(0_u16)
     @timestamp = Hash(UInt32, UInt32).new(0_u32)
@@ -56,6 +57,10 @@ module Wumble
       @speakers.each_with_index do |session, index|
         add_speaker_track(session, index.to_s) unless @tracks.has_key?(session)
       end
+      @pending_audio.each do |session, packets|
+        packets.each { |opus| forward_opus(session, @tracks[session], opus) }
+      end
+      @pending_audio.clear
     end
 
     def add_candidate(candidate : String, mid : String)
@@ -85,7 +90,22 @@ module Wumble
     # important boundary: no decoder, mixer, or shared browser MediaStream exists.
     def send_opus(session : UInt32, opus : Bytes)
       prepare_speaker(session)
-      track = @tracks[session]? || raise "speaker track is not negotiated yet"
+      if track = @tracks[session]?
+        forward_opus(session, track, opus)
+      else
+        packets = @pending_audio[session]
+        packets.shift if packets.size >= 50
+        packets << opus.dup
+        STDERR.puts "WebRTC: queued Opus packet for session #{session} until tracks are negotiated"
+      end
+    end
+
+    def close
+      LibDataChannel.rtc_delete_peer_connection(@pc) if @pc >= 0
+      @pc = -1
+    end
+
+    private def forward_opus(session : UInt32, track : LibDataChannel::Handle, opus : Bytes)
       sequence = @sequence[session] += 1
       timestamp = @timestamp[session] += 960 # 20 ms at Opus' 48 kHz RTP clock
       rtp = Bytes.new(12 + opus.size)
@@ -96,11 +116,6 @@ module Wumble
       IO::ByteFormat::BigEndian.encode(session, rtp[8, 4])
       rtp[12, opus.size].copy_from(opus)
       check LibDataChannel.rtc_send_message(track, rtp.to_unsafe, rtp.size)
-    end
-
-    def close
-      LibDataChannel.rtc_delete_peer_connection(@pc) if @pc >= 0
-      @pc = -1
     end
 
     private def add_speaker_track(session : UInt32, mid : String)
