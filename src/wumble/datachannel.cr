@@ -34,6 +34,7 @@ lib LibDataChannel
   fun rtc_get_remote_address = rtcGetRemoteAddress(pc : Handle, buffer : UInt8*, size : Int32) : Int32
   fun rtc_get_selected_candidate_pair = rtcGetSelectedCandidatePair(pc : Handle, local : UInt8*, local_size : Int32, remote : UInt8*, remote_size : Int32) : Int32
   fun rtc_add_track = rtcAddTrack(pc : Handle, sdp : UInt8*) : Handle
+  fun rtc_chain_rtcp_sr_reporter = rtcChainRtcpSrReporter(track : Handle) : Int32
   fun rtc_send_message = rtcSendMessage(track : Handle, data : UInt8*, size : Int32) : Int32
   fun rtc_get_buffered_amount = rtcGetBufferedAmount(id : Handle) : Int32
   fun rtc_is_open = rtcIsOpen(id : Handle) : Bool
@@ -53,6 +54,7 @@ module Wumble
     @sequence = Hash(UInt32, UInt16).new(0_u16)
     @timestamp = Hash(UInt32, UInt32).new(0_u32)
     @first_packet = Hash(UInt32, Bool).new(true)
+    @next_send_at = Hash(UInt32, Time::Instant).new
     @last_debug_at = Time.instant
     @remote_description_set = false
 
@@ -124,6 +126,8 @@ module Wumble
     end
 
     private def forward_opus(session : UInt32, track : LibDataChannel::Handle, opus : Bytes)
+      duration = opus_duration_samples(opus)
+      pace_opus(session, duration)
       mid = @track_mids[session]
       payload_type = @opus_payload_types[mid]
       # BUNDLE requires the MID extension to associate an RTP SSRC with its
@@ -148,7 +152,7 @@ module Wumble
       rtp[payload_offset, opus.size].copy_from(opus)
       check LibDataChannel.rtc_send_message(track, rtp.to_unsafe, rtp.size)
       @sequence[session] &+= 1_u16
-      @timestamp[session] &+= opus_duration_samples(opus)
+      @timestamp[session] &+= duration
       @first_packet[session] = false
       @sent_packets[session] += 1
       @sent_bytes[session] += opus.size.to_u64
@@ -165,9 +169,24 @@ module Wumble
       sdp = "m=audio 9 UDP/TLS/RTP/SAVPF #{payload_type}\r\na=mid:#{mid}\r\na=sendonly\r\na=rtpmap:#{payload_type} opus/48000/2\r\na=fmtp:#{payload_type} minptime=10;useinbandfec=1\r\na=ssrc:#{session} cname:wumble-#{session}\r\n"
       track = LibDataChannel.rtc_add_track(@pc, sdp.to_unsafe)
       raise "rtcAddTrack failed (#{track})" if track < 0
+      check LibDataChannel.rtc_chain_rtcp_sr_reporter(track)
       STDERR.puts "WebRTC: added Opus track session=#{session} mid=#{mid} track=#{track} ssrc=#{session} payload_type=#{payload_type} mid_extension=#{@mid_extension_ids[mid]?}" if debug?
       @tracks[session] = track
       @track_mids[session] = mid
+    end
+
+    # Mumble's TCP tunnel is read in batches, while the Opus RTP timestamp
+    # describes 10 ms frames. Sending a batch immediately creates jitter-buffer
+    # latency in Firefox; release its samples on the RTP media clock instead.
+    private def pace_opus(session : UInt32, duration : UInt32)
+      now = Time.instant
+      if next_at = @next_send_at[session]?
+        if next_at > now
+          sleep next_at - now
+          now = Time.instant
+        end
+      end
+      @next_send_at[session] = now + (duration.to_f / 48_000).seconds
     end
 
     private def mid_extension_ids(sdp : String) : Hash(String, UInt8)
