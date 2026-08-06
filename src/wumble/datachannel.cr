@@ -60,6 +60,7 @@ module Wumble
     @sequence = Hash(UInt32, UInt16).new(0_u16)
     @timestamp = Hash(UInt32, UInt32).new(0_u32)
     @first_packet = Hash(UInt32, Bool).new(true)
+    @receiver_fd : Int32
     @next_mumble_frame = Hash(UInt32, UInt32).new
     @mumble_packet_frames = Hash(UInt32, UInt32).new
     @last_debug_at = Time.instant
@@ -81,7 +82,7 @@ module Wumble
       raise "rtcCreatePeerConnection failed" if @pc < 0
       receiver_fd = LibDataChannel.wumble_receiver_start(@pc)
       raise "could not start WebRTC audio receiver" if receiver_fd < 0
-      @receiver = IO::FileDescriptor.new(receiver_fd)
+      @receiver_fd = receiver_fd
       spawn { receive_browser_audio }
       spawn { log_browser_receiver_debug }
     end
@@ -181,16 +182,31 @@ module Wumble
     end
 
     private def receive_browser_audio
-      loop do
-        header = Bytes.new(2)
-        @receiver.read_fully(header)
-        size = IO::ByteFormat::BigEndian.decode(UInt16, header).to_i
-        raise "invalid browser audio packet size" if size == 0 || size > 4093
-        packet = Bytes.new(size)
-        @receiver.read_fully(packet)
-        if audio = opus_payload(packet)
-          opus, rtp_timestamp = audio
-          forward_browser_opus(opus, rtp_timestamp) unless opus.empty?
+      buffer = Bytes.new(4_096)
+      pending = [] of UInt8
+      until @closed
+        count = LibC.read(@receiver_fd, buffer.to_unsafe, buffer.size)
+        if count > 0
+          buffer[0, count.to_i].each { |byte| pending << byte }
+          offset = 0
+          while pending.size - offset >= 2
+            size = (pending[offset].to_i << 8) | pending[offset + 1].to_i
+            raise "invalid browser audio packet size" if size == 0 || size > 4093
+            break if pending.size - offset < size + 2
+            packet = Bytes.new(size) { |index| pending[offset + 2 + index] }
+            if audio = opus_payload(packet)
+              opus, rtp_timestamp = audio
+              forward_browser_opus(opus, rtp_timestamp) unless opus.empty?
+            end
+            offset += size + 2
+          end
+          pending = offset < pending.size ? pending[offset..] : [] of UInt8
+        elsif count == 0
+          break
+        elsif Errno.value == Errno::EAGAIN
+          sleep 1.millisecond
+        elsif Errno.value != Errno::EINTR
+          raise IO::Error.from_errno("WebRTC browser audio receiver read failed")
         end
       end
     rescue ex
