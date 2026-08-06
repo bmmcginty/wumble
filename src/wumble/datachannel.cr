@@ -70,6 +70,7 @@ module Wumble
     @pending_audio = Hash(UInt32, Array(Bytes)).new { |sessions, session| sessions[session] = [] of Bytes }
     @sent_packets = Hash(UInt32, UInt64).new(0_u64)
     @sent_bytes = Hash(UInt32, UInt64).new(0_u64)
+    @opus_payload_types = Hash(String, UInt8).new
     @last_debug_at = Time.instant
     @remote_description_set = false
 
@@ -85,6 +86,7 @@ module Wumble
     end
 
     def accept_offer(sdp : String)
+      @opus_payload_types = opus_payload_types(sdp)
       result = LibDataChannel.rtc_set_remote_description(@pc, sdp.to_unsafe, "offer".to_unsafe)
       raise "rtcSetRemoteDescription failed (#{result})" if result < 0
       @remote_description_set = true
@@ -165,7 +167,11 @@ module Wumble
     private def add_speaker_track(session : UInt32, mid : String)
       # A stable, per-speaker SSRC lets the browser expose each voice as an
       # independent MediaStreamTrack.
-      sdp = "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:#{mid}\r\na=sendonly\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1\r\na=ssrc:#{session} cname:wumble-#{session}\r\n"
+      # RTP payload types are scoped to the offer. Chrome generally offers
+      # Opus as 111, while Firefox commonly uses 109; answering with a new
+      # payload type makes Firefox discard otherwise valid SRTP packets.
+      payload_type = @opus_payload_types[mid]? || raise "offer has no Opus payload type for audio mid #{mid}"
+      sdp = "m=audio 9 UDP/TLS/RTP/SAVPF #{payload_type}\r\na=mid:#{mid}\r\na=sendonly\r\na=rtpmap:#{payload_type} opus/48000/2\r\na=fmtp:#{payload_type} minptime=10;useinbandfec=1\r\na=ssrc:#{session} cname:wumble-#{session}\r\n"
       track = LibDataChannel.rtc_add_track(@pc, sdp.to_unsafe)
       raise "rtcAddTrack failed (#{track})" if track < 0
       # rtcSendMessage sends encoded Opus samples through this packetizer. It
@@ -175,11 +181,25 @@ module Wumble
       packetizer = LibDataChannel::PacketizerInit.new
       packetizer.ssrc = session
       packetizer.cname = cname.to_unsafe
-      packetizer.payload_type = 111_u8
+      packetizer.payload_type = payload_type
       packetizer.clock_rate = 48_000_u32
       check LibDataChannel.rtc_set_opus_packetizer(track, pointerof(packetizer))
-      STDERR.puts "WebRTC: added Opus track session=#{session} mid=#{mid} track=#{track} ssrc=#{session} payload_type=111" if debug?
+      STDERR.puts "WebRTC: added Opus track session=#{session} mid=#{mid} track=#{track} ssrc=#{session} payload_type=#{payload_type}" if debug?
       @tracks[session] = track
+    end
+
+    private def opus_payload_types(sdp : String) : Hash(String, UInt8)
+      payload_types = Hash(String, UInt8).new
+      # Each m= section has its own dynamic payload-type namespace.
+      sdp.split("\nm=").each do |section|
+        next unless section.starts_with?("audio ")
+        mid = section.match(/(?:\A|\n)a=mid:([^\r\n]+)/).try(&.[1])
+        opus = section.match(/(?:\A|\n)a=rtpmap:(\d+)\s+opus\/48000(?:\/\d+)?/i).try(&.[1])
+        next unless mid && opus
+        payload_type = opus.to_u16?
+        payload_types[mid] = payload_type.to_u8 if payload_type && payload_type <= UInt8::MAX
+      end
+      payload_types
     end
 
     # libdatachannel has no C API for outbound RTP counters. These values show
