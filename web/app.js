@@ -111,6 +111,9 @@ async function makeOffer(speakerCount = 1) {
   for (let index = 0; index < Math.max(1, speakerCount); index += 1) {
     peer.addTransceiver('audio', { direction: 'recvonly' });
   }
+  // This creates a separate sendonly m= section. The gateway forwards its
+  // Opus RTP payloads directly to Mumble; it is never mixed with speakers.
+  peer.addTrack(microphoneStream.getAudioTracks()[0], microphoneStream);
   peer.onicecandidate = ({ candidate }) => {
     if (candidate) {
       browserLog('local ICE candidate', { mid: candidate.sdpMid, type: candidate.type, protocol: candidate.protocol });

@@ -74,6 +74,18 @@ module Wumble
       spawn { ping_loop }
     end
 
+    # Sends one browser-produced Opus packet as a MumbleUDP.Audio message.
+    # frame_number is measured in Mumble's 10 ms (480 sample) units.
+    def send_opus(opus : Bytes, frame_number : UInt32)
+      return unless crypt = @crypt
+      return unless udp = @udp
+      payload = Bytes[0_u8] + Protobuf.field(4, frame_number.to_u64) + Protobuf.bytes(5, opus)
+      udp.send(crypt.encrypt(payload))
+      STDERR.puts "Mumble: sent #{opus.size}-byte browser Opus packet frame=#{frame_number}" if ENV["WUMBLE_DEBUG"]? == "1"
+    rescue ex
+      STDERR.puts "Mumble UDP voice send failed: #{ex.message || ex.class.name}" unless @closed
+    end
+
     def close
       return if @closed
       @closed = true
@@ -140,9 +152,9 @@ module Wumble
           @on_ready.try &.call
         when USER_STATE  then update_user(payload)
         when CRYPT_SETUP then configure_crypt(payload)
-        # Native encrypted UDP is required for voice. Do not feed the TCP
-        # fallback into WebRTC, where its head-of-line blocking adds latency.
-        when UDPTUNNEL   then STDERR.puts "Mumble: ignoring TCP UDPTunnel voice; using native UDP"
+          # Native encrypted UDP is required for voice. Do not feed the TCP
+          # fallback into WebRTC, where its head-of-line blocking adds latency.
+        when UDPTUNNEL then STDERR.puts "Mumble: ignoring TCP UDPTunnel voice; using native UDP"
         end
       end
     rescue ex

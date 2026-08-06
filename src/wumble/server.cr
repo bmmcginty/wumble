@@ -45,6 +45,7 @@ module Wumble
             validate(request)
             peer = Peer.new
             mumble = MumbleConnection.new(request.server, request.port, request.username, request.password)
+            peer.not_nil!.on_opus { |opus, frame_number| mumble.not_nil!.send_opus(opus, frame_number) }
             mumble.not_nil!.on_user { |speaker, _name| peer.not_nil!.prepare_speaker(speaker) }
             mumble.not_nil!.on_voice { |speaker, opus, frame_number| peer.not_nil!.send_opus(speaker, opus, frame_number) }
             mumble.not_nil!.on_voice_end { |speaker| peer.not_nil!.end_voice(speaker) }

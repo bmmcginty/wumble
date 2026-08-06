@@ -1,6 +1,7 @@
 require "set"
 
 @[Link("datachannel")]
+@[Link(ldflags: "#{__DIR__}/receiver_bridge.c")]
 lib LibDataChannel
   alias Handle = Int32
 
@@ -33,6 +34,8 @@ lib LibDataChannel
   fun rtc_get_local_address = rtcGetLocalAddress(pc : Handle, buffer : UInt8*, size : Int32) : Int32
   fun rtc_get_remote_address = rtcGetRemoteAddress(pc : Handle, buffer : UInt8*, size : Int32) : Int32
   fun rtc_get_selected_candidate_pair = rtcGetSelectedCandidatePair(pc : Handle, local : UInt8*, local_size : Int32, remote : UInt8*, remote_size : Int32) : Int32
+  fun wumble_receiver_start = wumble_receiver_start(pc : Handle) : Int32
+  fun wumble_receiver_stop = wumble_receiver_stop(pc : Handle)
   fun rtc_add_track = rtcAddTrack(pc : Handle, sdp : UInt8*) : Handle
   fun rtc_send_message = rtcSendMessage(track : Handle, data : UInt8*, size : Int32) : Int32
   fun rtc_get_buffered_amount = rtcGetBufferedAmount(id : Handle) : Int32
@@ -65,8 +68,18 @@ module Wumble
       # libdatachannel requires a real (zero-initialized) configuration to use
       # its defaults; passing NULL segfaults in libdatachannel 0.24.
       config = LibDataChannel::Configuration.new
+      @browser_frame_number = 0_u32
+      @closed = false
       @pc = LibDataChannel.rtc_create_peer_connection(pointerof(config))
       raise "rtcCreatePeerConnection failed" if @pc < 0
+      receiver_fd = LibDataChannel.wumble_receiver_start(@pc)
+      raise "could not start WebRTC audio receiver" if receiver_fd < 0
+      @receiver = IO::FileDescriptor.new(receiver_fd)
+      spawn { receive_browser_audio }
+    end
+
+    def on_opus(&block : Bytes, UInt32 ->)
+      @on_opus = block
     end
 
     def accept_offer(sdp : String)
@@ -130,8 +143,52 @@ module Wumble
     end
 
     def close
-      LibDataChannel.rtc_delete_peer_connection(@pc) if @pc >= 0
+      return if @closed
+      @closed = true
+      if @pc >= 0
+        LibDataChannel.wumble_receiver_stop(@pc)
+        LibDataChannel.rtc_delete_peer_connection(@pc)
+      end
       @pc = -1
+    end
+
+    # Packets cross the C bridge through a pipe so all parsing and Mumble I/O
+    # runs on a Crystal-managed fiber rather than libdatachannel's threads.
+    private def receive_browser_audio
+      loop do
+        header = Bytes.new(2)
+        @receiver.read_fully(header)
+        size = IO::ByteFormat::BigEndian.decode(UInt16, header).to_i
+        raise "invalid browser audio packet size" if size == 0 || size > 4093
+        packet = Bytes.new(size)
+        @receiver.read_fully(packet)
+        if opus = opus_payload(packet)
+          forward_browser_opus(opus) unless opus.empty?
+        end
+      end
+    rescue ex
+      STDERR.puts "WebRTC browser audio receiver closed: #{ex.message || ex.class.name}" unless @closed
+    end
+
+    private def forward_browser_opus(opus : Bytes)
+      @on_opus.try &.call(opus, @browser_frame_number)
+      @browser_frame_number += opus_duration_samples(opus) // 480_u32
+    end
+
+    private def opus_payload(packet : Bytes) : Bytes?
+      # A track message is normally an RTP packet. Keep the raw-payload path
+      # for libdatachannel versions configured with an Opus depacketizer.
+      return packet unless packet.size >= 12 && (packet[0] >> 6) == 2
+      offset = 12 + (packet[0] & 0x0f) * 4
+      return nil if offset > packet.size
+      if packet[0] & 0x10 != 0
+        return nil if offset + 4 > packet.size
+        extension_words = IO::ByteFormat::BigEndian.decode(UInt16, packet[offset + 2, 2])
+        offset += 4 + extension_words * 4
+      end
+      padding = packet[0] & 0x20 != 0 ? packet[-1].to_i : 0
+      return nil if padding > packet.size - offset
+      packet[offset, packet.size - offset - padding]
     end
 
     private def forward_opus(session : UInt32, track : LibDataChannel::Handle, opus : Bytes, frame_number : UInt32?)
@@ -201,14 +258,14 @@ module Wumble
       return 960_u32 if opus.empty?
       config = opus[0] >> 3
       samples_per_frame = case config
-                          when 0..11 then [480_u32, 960_u32, 1_920_u32, 2_880_u32][config % 4]
+                          when 0..11  then [480_u32, 960_u32, 1_920_u32, 2_880_u32][config % 4]
                           when 12..15 then [480_u32, 960_u32][config % 2]
-                          else              [120_u32, 240_u32, 480_u32, 960_u32][config % 4]
+                          else             [120_u32, 240_u32, 480_u32, 960_u32][config % 4]
                           end
       frame_count = case opus[0] & 0x03
-                    when 0 then 1_u32
+                    when 0    then 1_u32
                     when 1, 2 then 2_u32
-                    else opus.size > 1 ? (opus[1] & 0x3f).to_u32 : 1_u32
+                    else           opus.size > 1 ? (opus[1] & 0x3f).to_u32 : 1_u32
                     end
       samples_per_frame * frame_count
     end
