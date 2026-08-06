@@ -1,6 +1,8 @@
 const form = document.querySelector('#connect');
 const status = document.querySelector('#status');
 const speakers = document.querySelector('#speakers');
+const channelControl = document.querySelector('#channel-control');
+const channelSelect = document.querySelector('#channel');
 const connectionToggle = document.querySelector('#connection-toggle');
 let socket;
 let peer;
@@ -16,6 +18,7 @@ let reconnectEnabled = false;
 let connectionActive = false;
 let wakeLock;
 const speakerInfoByMid = new Map();
+const currentChannelSessions = new Set();
 const connectionFragmentFields = [
   { parameter: 'host', input: form.elements.namedItem('server') },
   { parameter: 'port', input: form.elements.namedItem('port') },
@@ -133,6 +136,27 @@ function setConnectionActive(active) {
   connectionToggle.textContent = active ? 'Disconnect' : 'Connect';
 }
 function signal(message) { socket.send(JSON.stringify(message)); }
+function updateChannels({ current_channel: currentChannel, channels, users }) {
+  const selected = String(currentChannel ?? '');
+  channelSelect.replaceChildren();
+  for (const channel of (channels || []).sort((left, right) => left.name.localeCompare(right.name))) {
+    const option = document.createElement('option');
+    option.value = String(channel.id);
+    option.textContent = channel.name;
+    option.selected = option.value === selected;
+    channelSelect.append(option);
+  }
+  channelControl.hidden = channelSelect.options.length === 0;
+  channelSelect.disabled = !connectionActive || !selected;
+  currentChannelSessions.clear();
+  for (const user of users || []) currentChannelSessions.add(String(user.session));
+  for (const article of speakers.querySelectorAll('article')) {
+    if (!currentChannelSessions.has(article.dataset.session)) article.remove();
+  }
+}
+channelSelect.addEventListener('change', () => {
+  if (connectionActive && channelSelect.value) signal({ type: 'switch_channel', channel: Number(channelSelect.value) });
+});
 function browserLog(event, details = {}) {
   console.info(`Wumble: ${event}`, details);
   if (socket?.readyState === WebSocket.OPEN) signal({ type: 'log', event, details });
@@ -279,6 +303,7 @@ async function makeOffer(speakerCount = 1) {
     audio.onerror = () => browserLog('speaker audio error', { track: track.id, session: speaker?.session ?? null, error: audio.error?.message });
     track.onmute = () => browserLog('remote track muted', { id: track.id, session: speaker?.session ?? null });
     track.onunmute = () => browserLog('remote track unmuted', { id: track.id, session: speaker?.session ?? null });
+    container.dataset.session = speaker?.session ?? '';
     container.append(heading, volumeLabel, audio);
     speakers.append(container);
     track.onended = () => { browserLog('remote track ended', { id: track.id, session: speaker?.session ?? null }); container.remove(); };
@@ -327,6 +352,15 @@ function connectSignalling() {
       reconnectAttempts = 0;
       browserLog('creating offer', { speakers: message.speakers });
       await makeOffer(message.speakers);
+    } else if (message.type === 'channel_state') {
+      updateChannels(message);
+    } else if (message.type === 'restart_webrtc') {
+      browserLog('restarting WebRTC for channel change', { speakers: message.speakers });
+      peer?.close();
+      peer = undefined;
+      speakerInfoByMid.clear();
+      speakers.replaceChildren();
+      await makeOffer(message.speakers);
     } else if (message.type === 'answer') {
       speakerInfoByMid.clear();
       for (const speaker of message.speakers || []) speakerInfoByMid.set(speaker.mid, speaker);
@@ -334,6 +368,7 @@ function connectSignalling() {
       browserLog('accepted WebRTC answer', { sdpBytes: message.sdp.length });
       setStatus('Connected');
       setConnectionActive(true);
+      channelSelect.disabled = false;
       void requestWakeLock();
       await attemptRenegotiation();
     } else if (message.type === 'renegotiate') {
@@ -363,6 +398,7 @@ function connectSignalling() {
     peer = undefined;
     console.info(`Wumble signalling WebSocket closed (${code}: ${reason || 'no reason'})`);
     setConnectionActive(false);
+    channelSelect.disabled = true;
     void releaseWakeLock();
     if (reconnectEnabled) {
       scheduleReconnect();
@@ -386,6 +422,7 @@ form.addEventListener('submit', async (event) => {
     window.clearInterval(statsTimer);
     stopMicrophone();
     setConnectionActive(false);
+    channelSelect.disabled = true;
     void releaseWakeLock();
     setStatus('Disconnected');
     return;

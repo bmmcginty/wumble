@@ -27,6 +27,7 @@ module Wumble
       STDERR.puts "WebRTC signalling: WebSocket opened"
       peer = nil.as(Peer?)
       mumble = nil.as(MumbleConnection?)
+      active_channel = nil.as(UInt32?)
       socket.on_message do |message|
         begin
           data = JSON.parse(message)
@@ -50,8 +51,26 @@ module Wumble
               socket.send({type: type, message: reason}.to_json)
             end
             peer.not_nil!.on_opus { |opus, frame_number| mumble.not_nil!.send_opus(opus, frame_number) }
+            mumble.not_nil!.on_state do
+              connection = mumble.not_nil!
+              channel = connection.current_channel
+              socket.send(channel_state(connection).to_json)
+              if active_channel && channel && active_channel != channel
+                peer.try &.close
+                peer = Peer.new
+                peer.not_nil!.on_opus { |opus, frame_number| mumble.not_nil!.send_opus(opus, frame_number) }
+                connection.channel_users.each_key { |speaker| peer.not_nil!.prepare_speaker(speaker) }
+                socket.send({type: "restart_webrtc", speakers: connection.channel_users.size}.to_json)
+              end
+              active_channel = channel if channel
+            end
             mumble.not_nil!.on_user do |speaker, _name|
-              socket.send({type: "renegotiate"}.to_json) if peer.not_nil!.prepare_speaker(speaker)
+              connection = mumble.not_nil!
+              if channel = connection.current_channel
+                if connection.user_channels[speaker]? == channel
+                  socket.send({type: "renegotiate"}.to_json) if peer.not_nil!.prepare_speaker(speaker)
+                end
+              end
             end
             mumble.not_nil!.on_voice { |speaker, opus, frame_number| peer.not_nil!.send_opus(speaker, opus, frame_number) }
             mumble.not_nil!.on_voice_end { |speaker| peer.not_nil!.end_voice(speaker) }
@@ -59,19 +78,26 @@ module Wumble
             # TCP UDPTunnel voice is deliberately not a fallback because its
             # head-of-line blocking causes the latency this gateway avoids.
             mumble.not_nil!.on_ready do
-              if mumble.not_nil!.udp_available
-                socket.send({type: "connected", speakers: mumble.not_nil!.users.size}.to_json)
+              connection = mumble.not_nil!
+              connection.channel_users.each_key { |speaker| peer.not_nil!.prepare_speaker(speaker) }
+              if connection.udp_available
+                socket.send({type: "connected", speakers: connection.channel_users.size}.to_json)
               end
             end
             mumble.not_nil!.on_udp_available do
-              if mumble.not_nil!.synchronized
-                socket.send({type: "connected", speakers: mumble.not_nil!.users.size}.to_json)
+              connection = mumble.not_nil!
+              connection.channel_users.each_key { |speaker| peer.not_nil!.prepare_speaker(speaker) }
+              if connection.synchronized
+                socket.send({type: "connected", speakers: connection.channel_users.size}.to_json)
               end
             end
             mumble.not_nil!.on_udp_unavailable do
               socket.send({type: "udp_unavailable", message: "Native UDP to the Mumble server is unavailable. Check UDP port #{request.port}."}.to_json)
             end
             mumble.not_nil!.connect
+          when "switch_channel"
+            raise "connect before switching channels" unless mumble
+            mumble.not_nil!.switch_channel(data["channel"].as_i.to_u32)
           when "offer"
             raise "connect before sending an offer" unless peer
             current_peer = peer.not_nil!
@@ -110,6 +136,15 @@ module Wumble
         mumble.try &.close
         peer.try &.close
       end
+    end
+
+    private def channel_state(mumble : MumbleConnection)
+      {
+        type: "channel_state",
+        current_channel: mumble.current_channel,
+        channels: mumble.channels.map { |id, name| {id: id, name: name} },
+        users: mumble.channel_users.map { |session, name| {session: session, name: name} },
+      }
     end
 
     private def validate(request : ConnectRequest)

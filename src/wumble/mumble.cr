@@ -13,15 +13,19 @@ module Wumble
     PING          =  3
     REJECT        =  4
     SERVER_SYNC   =  5
+    CHANNEL_STATE =  7
     USER_STATE    =  9
     USER_REMOVE   = 12
     CRYPT_SETUP   = 15
     CODEC_VERSION = 21
 
     getter users = Hash(UInt32, String).new
+    getter channels = Hash(UInt32, String).new
+    getter user_channels = Hash(UInt32, UInt32).new
     getter on_voice : Proc(UInt32, Bytes, UInt32?, Nil)?
     getter on_voice_end : Proc(UInt32, Nil)?
     getter on_user : Proc(UInt32, String, Nil)?
+    getter on_state : Proc(Nil)?
     getter on_ready : Proc(Nil)?
     getter on_udp_available : Proc(Nil)?
     getter on_udp_unavailable : Proc(Nil)?
@@ -53,6 +57,25 @@ module Wumble
 
     def on_ready(&block : ->)
       @on_ready = block
+    end
+
+    def on_state(&block : ->)
+      @on_state = block
+    end
+
+    def current_channel : UInt32?
+      @session.try { |session| @user_channels[session]? }
+    end
+
+    def channel_users : Hash(UInt32, String)
+      channel = current_channel
+      return Hash(UInt32, String).new unless channel
+      @users.select { |session, _name| @user_channels[session]? == channel }
+    end
+
+    def switch_channel(channel : UInt32)
+      raise "unknown Mumble channel #{channel}" unless @channels.has_key?(channel)
+      send_packet(USER_STATE, Protobuf.field(5, channel.to_u64))
     end
 
     def on_udp_available(&block : ->)
@@ -159,8 +182,9 @@ module Wumble
         STDERR.puts "Mumble: received #{packet_name(type)} (#{payload.size} bytes)" unless type == UDPTUNNEL
         case type
         when REJECT then reject(payload)
-        when SERVER_SYNC then synchronize(payload)
-        when USER_STATE  then update_user(payload)
+        when SERVER_SYNC   then synchronize(payload)
+        when CHANNEL_STATE then update_channel(payload)
+        when USER_STATE    then update_user(payload)
         when USER_REMOVE then user_removed(payload)
         when CRYPT_SETUP then configure_crypt(payload)
           # Native encrypted UDP is required for voice. Do not feed the TCP
@@ -187,6 +211,7 @@ module Wumble
       STDERR.puts "Mumble: authenticated and synchronized"
       @synchronized = true
       @on_ready.try &.call
+      @on_state.try &.call
     end
 
     private def user_removed(payload : Bytes)
@@ -197,6 +222,11 @@ module Wumble
         when 1 then removed_session = Protobuf.read_varint(value, 0)[0].to_u32 if wire == 0
         when 3 then reason = String.new(value) if wire == 2
         end
+      end
+      if removed_session
+        @users.delete(removed_session.not_nil!)
+        @user_channels.delete(removed_session.not_nil!)
+        @on_state.try &.call
       end
       return unless removed_session && removed_session == @session
       close
@@ -293,18 +323,35 @@ module Wumble
       receive_protobuf_audio(packet[1..]) if packet[0] == 0_u8
     end
 
+    private def update_channel(payload : Bytes)
+      channel = nil.as(UInt32?)
+      name = nil.as(String?)
+      Protobuf.fields(payload) do |number, wire, value|
+        case number
+        when 1 then channel = Protobuf.read_varint(value, 0)[0].to_u32 if wire == 0
+        when 3 then name = String.new(value) if wire == 2
+        end
+      end
+      @channels[channel.not_nil!] = name.not_nil! if channel && name
+      @on_state.try &.call
+    end
+
     private def update_user(payload : Bytes)
-      session = nil
-      name = nil
+      session = nil.as(UInt32?)
+      name = nil.as(String?)
+      channel = nil.as(UInt32?)
       Protobuf.fields(payload) do |number, wire, value|
         case number
         when 1 then session = Protobuf.read_varint(value, 0)[0].to_u32 if wire == 0
         when 3 then name = String.new(value) if wire == 2
+        when 5 then channel = Protobuf.read_varint(value, 0)[0].to_u32 if wire == 0
         end
       end
-      if session && name
-        @users[session.not_nil!] = name.not_nil!
-        @on_user.try &.call(session.not_nil!, name.not_nil!)
+      if session
+        @users[session.not_nil!] = name.not_nil! if name
+        @user_channels[session.not_nil!] = channel.not_nil! if channel
+        @on_user.try &.call(session.not_nil!, name.not_nil!) if name
+        @on_state.try &.call
       end
     end
 
@@ -316,6 +363,7 @@ module Wumble
       when PING          then "Ping"
       when REJECT        then "Reject"
       when SERVER_SYNC   then "ServerSync"
+      when CHANNEL_STATE then "ChannelState"
       when USER_STATE    then "UserState"
       when USER_REMOVE   then "UserRemove"
       when CRYPT_SETUP   then "CryptSetup"
