@@ -32,6 +32,7 @@ lib LibDataChannel
   fun rtc_get_local_description = rtcGetLocalDescription(pc : Handle, buffer : UInt8*, size : Int32) : Int32
   fun rtc_add_track = rtcAddTrack(pc : Handle, sdp : UInt8*) : Handle
   fun rtc_send_message = rtcSendMessage(track : Handle, data : UInt8*, size : Int32) : Int32
+  fun rtc_is_open = rtcIsOpen(id : Handle) : Bool
 end
 
 module Wumble
@@ -62,10 +63,6 @@ module Wumble
       @speakers.each_with_index do |session, index|
         add_speaker_track(session, index.to_s) unless @tracks.has_key?(session)
       end
-      @pending_audio.each do |session, packets|
-        packets.each { |opus| forward_opus(session, @tracks[session], opus) }
-      end
-      @pending_audio.clear
     end
 
     def add_candidate(candidate : String, mid : String)
@@ -96,18 +93,34 @@ module Wumble
     def send_opus(session : UInt32, opus : Bytes)
       prepare_speaker(session)
       if track = @tracks[session]?
-        forward_opus(session, track, opus)
+        if LibDataChannel.rtc_is_open(track)
+          flush_pending(session, track)
+          forward_opus(session, track, opus)
+        else
+          queue_opus(session, opus)
+        end
       else
-        packets = @pending_audio[session]
-        packets.shift if packets.size >= 50
-        packets << opus.dup
-        STDERR.puts "WebRTC: queued Opus packet for session #{session} until tracks are negotiated"
+        queue_opus(session, opus)
       end
     end
 
     def close
       LibDataChannel.rtc_delete_peer_connection(@pc) if @pc >= 0
       @pc = -1
+    end
+
+    private def queue_opus(session : UInt32, opus : Bytes)
+      packets = @pending_audio[session]
+      packets.shift if packets.size >= 50
+      packets << opus.dup
+      STDERR.puts "WebRTC: queued Opus packet for session #{session} until its track is open"
+    end
+
+    private def flush_pending(session : UInt32, track : LibDataChannel::Handle)
+      if packets = @pending_audio.delete(session)
+        STDERR.puts "WebRTC: forwarding #{packets.size} queued Opus packets for session #{session}"
+        packets.each { |opus| forward_opus(session, track, opus) }
+      end
     end
 
     private def forward_opus(session : UInt32, track : LibDataChannel::Handle, opus : Bytes)
