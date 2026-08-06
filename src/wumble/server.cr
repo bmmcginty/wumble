@@ -47,6 +47,7 @@ module Wumble
             mumble = MumbleConnection.new(request.server, request.port, request.username, request.password)
             mumble.not_nil!.on_user { |speaker, _name| peer.not_nil!.prepare_speaker(speaker) }
             mumble.not_nil!.on_voice { |speaker, opus| peer.not_nil!.send_opus(speaker, opus) }
+            mumble.not_nil!.on_voice_end { |speaker| peer.not_nil!.end_voice(speaker) }
             # Wait for UserState packets before asking the browser for an offer:
             # the answer then advertises a separate track for every speaker.
             mumble.not_nil!.on_ready do

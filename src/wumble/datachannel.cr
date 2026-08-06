@@ -119,6 +119,13 @@ module Wumble
       end
     end
 
+    # A Mumble terminator starts a new talkspurt. Reset the RTP marker and
+    # pacing clock so silence cannot turn into queued playout latency.
+    def end_voice(session : UInt32)
+      @first_packet[session] = true
+      @next_send_at.delete(session)
+    end
+
     def close
       LibDataChannel.rtc_delete_peer_connection(@pc) if @pc >= 0
       @pc = -1

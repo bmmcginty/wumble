@@ -19,6 +19,7 @@ module Wumble
 
     getter users = Hash(UInt32, String).new
     getter on_voice : Proc(UInt32, Bytes, Nil)?
+    getter on_voice_end : Proc(UInt32, Nil)?
     getter on_user : Proc(UInt32, String, Nil)?
     getter on_ready : Proc(Nil)?
 
@@ -31,6 +32,10 @@ module Wumble
 
     def on_voice(&block : UInt32, Bytes ->)
       @on_voice = block
+    end
+
+    def on_voice_end(&block : UInt32 ->)
+      @on_voice_end = block
     end
 
     def on_user(&block : UInt32, String ->)
@@ -212,17 +217,20 @@ module Wumble
       return if session > UInt32::MAX
       _sequence, offset = Protobuf.read_varint(packet, offset)
       size, offset = Protobuf.read_varint(packet, offset)
+      terminator = size & 0x2000_u64 != 0
       size &= 0x1fff_u64 # Mumble's high bit is the end-of-transmission marker.
       return if offset > packet.size || size > (packet.size - offset).to_u64
       finish = offset + size.to_i
       opus = packet[offset...finish]
       STDERR.puts "Mumble: forwarding #{opus.size}-byte Opus packet from session #{session}"
       @on_voice.try &.call(session.to_u32, opus)
+      @on_voice_end.try &.call(session.to_u32) if terminator
     end
 
     private def receive_protobuf_audio(payload : Bytes)
       session = nil.as(UInt32?)
       opus = nil.as(Bytes?)
+      terminator = false
       Protobuf.fields(payload) do |number, wire, value|
         case number
         when 3
@@ -230,11 +238,16 @@ module Wumble
           session = sender.to_u32 if wire == 0 && sender <= UInt32::MAX
         when 5
           opus = value if wire == 2
+        when 6
+          terminator = Protobuf.read_varint(value, 0)[0] != 0 if wire == 0
         end
       end
-      return unless session && opus
-      STDERR.puts "Mumble: forwarding #{opus.not_nil!.size}-byte protobuf Opus packet from session #{session}"
-      @on_voice.try &.call(session.not_nil!, opus.not_nil!)
+      return unless session
+      if opus
+        STDERR.puts "Mumble: forwarding #{opus.not_nil!.size}-byte protobuf Opus packet from session #{session}"
+        @on_voice.try &.call(session.not_nil!, opus.not_nil!)
+      end
+      @on_voice_end.try &.call(session.not_nil!) if terminator
     end
   end
 end
