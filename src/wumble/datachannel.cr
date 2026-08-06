@@ -34,7 +34,6 @@ lib LibDataChannel
   fun rtc_get_remote_address = rtcGetRemoteAddress(pc : Handle, buffer : UInt8*, size : Int32) : Int32
   fun rtc_get_selected_candidate_pair = rtcGetSelectedCandidatePair(pc : Handle, local : UInt8*, local_size : Int32, remote : UInt8*, remote_size : Int32) : Int32
   fun rtc_add_track = rtcAddTrack(pc : Handle, sdp : UInt8*) : Handle
-  fun rtc_chain_rtcp_sr_reporter = rtcChainRtcpSrReporter(track : Handle) : Int32
   fun rtc_send_message = rtcSendMessage(track : Handle, data : UInt8*, size : Int32) : Int32
   fun rtc_get_buffered_amount = rtcGetBufferedAmount(id : Handle) : Int32
   fun rtc_is_open = rtcIsOpen(id : Handle) : Bool
@@ -169,7 +168,6 @@ module Wumble
       sdp = "m=audio 9 UDP/TLS/RTP/SAVPF #{payload_type}\r\na=mid:#{mid}\r\na=sendonly\r\na=rtpmap:#{payload_type} opus/48000/2\r\na=fmtp:#{payload_type} minptime=10;useinbandfec=1\r\na=ssrc:#{session} cname:wumble-#{session}\r\n"
       track = LibDataChannel.rtc_add_track(@pc, sdp.to_unsafe)
       raise "rtcAddTrack failed (#{track})" if track < 0
-      check LibDataChannel.rtc_chain_rtcp_sr_reporter(track)
       STDERR.puts "WebRTC: added Opus track session=#{session} mid=#{mid} track=#{track} ssrc=#{session} payload_type=#{payload_type} mid_extension=#{@mid_extension_ids[mid]?}" if debug?
       @tracks[session] = track
       @track_mids[session] = mid
