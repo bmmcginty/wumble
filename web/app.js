@@ -9,6 +9,28 @@ let microphoneStream;
 let renegotiationRequested = false;
 let renegotiationInProgress = false;
 const speakerInfoByMid = new Map();
+const connectionFragmentFields = [
+  { parameter: 'host', input: form.elements.namedItem('server') },
+  { parameter: 'port', input: form.elements.namedItem('port') },
+  { parameter: 'user', input: form.elements.namedItem('username') },
+  { parameter: 'password', input: form.elements.namedItem('password') },
+];
+
+function loadConnectionFragment() {
+  const parameters = new URLSearchParams(location.hash.slice(1));
+  for (const { parameter, input } of connectionFragmentFields) {
+    if (parameters.has(parameter)) input.value = parameters.get(parameter);
+  }
+}
+
+function saveConnectionFragment() {
+  const parameters = new URLSearchParams();
+  for (const { parameter, input } of connectionFragmentFields) parameters.set(parameter, input.value);
+  history.replaceState(history.state, '', `${location.pathname}${location.search}#${parameters}`);
+}
+
+for (const { input } of connectionFragmentFields) input.addEventListener('blur', saveConnectionFragment);
+loadConnectionFragment();
 
 function metric(value) {
   return typeof value === 'number' ? Math.round(value * 1000) / 1000 : null;

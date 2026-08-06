@@ -14,7 +14,7 @@ crystal build src/wumble.cr --release
 ./wumble --bind 0.0.0.0 --port 8080
 ```
 
-Open `http://gateway-host:8080/` (serve Wumble behind HTTPS in production for iPhone microphone access, audio autoplay, and secure WebSocket access). Connect sends the captured microphone as a WebRTC Opus stream; Wumble forwards its Opus payloads directly to Mumble without decoding or mixing. Credentials are sent only over the signalling WebSocket and are never stored. Mumble connection state and control packet names are written to stderr. Set `WUMBLE_DEBUG=1` to print backtraces and periodic WebRTC outbound-media diagnostics, including selected ICE addresses, accepted Opus sample counts, and track send-buffer sizes.
+Open `http://gateway-host:8080/` (serve Wumble behind HTTPS in production for iPhone microphone access, audio autoplay, and secure WebSocket access). Connect sends the captured microphone as a WebRTC Opus stream; Wumble forwards its Opus payloads directly to Mumble without decoding or mixing. The connection fields are saved in the URL fragment when their inputs lose focus; fragments are not sent to the server, but passwords remain visible in browser history and copied links. Mumble connection state and control packet names are written to stderr. Set `WUMBLE_DEBUG=1` to print backtraces and periodic WebRTC outbound-media diagnostics, including selected ICE addresses, accepted Opus sample counts, and track send-buffer sizes.
 
 ## Network and deployment
 
