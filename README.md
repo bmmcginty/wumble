@@ -14,7 +14,7 @@ crystal build src/wumble.cr --release
 ./wumble --bind 0.0.0.0 --port 8080
 ```
 
-Open `http://gateway-host:8080/` (serve Wumble behind HTTPS in production for iPhone audio autoplay and secure WebSocket access). The form has the requested Mumble server, port, username, and password fields. Credentials are sent only over the signalling WebSocket and are never stored. Mumble connection state and control packet names are written to stderr; set `WUMBLE_DEBUG=1` to also print a backtrace when that connection closes unexpectedly.
+Open `http://gateway-host:8080/` (serve Wumble behind HTTPS in production for iPhone audio autoplay and secure WebSocket access). The form has the requested Mumble server, port, username, and password fields. Credentials are sent only over the signalling WebSocket and are never stored. Mumble connection state and control packet names are written to stderr. Set `WUMBLE_DEBUG=1` to print backtraces and periodic WebRTC outbound-media diagnostics, including selected ICE addresses, accepted Opus sample counts, and track send-buffer sizes.
 
 ## Network and deployment
 

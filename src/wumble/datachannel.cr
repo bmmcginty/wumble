@@ -30,6 +30,9 @@ lib LibDataChannel
   fun rtc_set_remote_description = rtcSetRemoteDescription(pc : Handle, sdp : UInt8*, type : UInt8*) : Int32
   fun rtc_add_remote_candidate = rtcAddRemoteCandidate(pc : Handle, candidate : UInt8*, mid : UInt8*) : Int32
   fun rtc_get_local_description = rtcGetLocalDescription(pc : Handle, buffer : UInt8*, size : Int32) : Int32
+  fun rtc_get_local_address = rtcGetLocalAddress(pc : Handle, buffer : UInt8*, size : Int32) : Int32
+  fun rtc_get_remote_address = rtcGetRemoteAddress(pc : Handle, buffer : UInt8*, size : Int32) : Int32
+  fun rtc_get_selected_candidate_pair = rtcGetSelectedCandidatePair(pc : Handle, local : UInt8*, local_size : Int32, remote : UInt8*, remote_size : Int32) : Int32
   struct PacketizerInit
     ssrc : UInt32
     cname : UInt8*
@@ -55,6 +58,7 @@ lib LibDataChannel
   fun rtc_add_track = rtcAddTrack(pc : Handle, sdp : UInt8*) : Handle
   fun rtc_set_opus_packetizer = rtcSetOpusPacketizer(track : Handle, init : PacketizerInit*) : Int32
   fun rtc_send_message = rtcSendMessage(track : Handle, data : UInt8*, size : Int32) : Int32
+  fun rtc_get_buffered_amount = rtcGetBufferedAmount(id : Handle) : Int32
   fun rtc_is_open = rtcIsOpen(id : Handle) : Bool
 end
 
@@ -64,6 +68,9 @@ module Wumble
     @tracks = Hash(UInt32, LibDataChannel::Handle).new
     @speakers = Set(UInt32).new
     @pending_audio = Hash(UInt32, Array(Bytes)).new { |sessions, session| sessions[session] = [] of Bytes }
+    @sent_packets = Hash(UInt32, UInt64).new(0_u64)
+    @sent_bytes = Hash(UInt32, UInt64).new(0_u64)
+    @last_debug_at = Time.instant
     @remote_description_set = false
 
     def initialize
@@ -150,6 +157,9 @@ module Wumble
       # incrementing a hand-built RTP timestamp by a fixed 960 samples makes
       # the browser discard or misplay streams with another frame duration.
       check LibDataChannel.rtc_send_message(track, opus.to_unsafe, opus.size)
+      @sent_packets[_session] += 1
+      @sent_bytes[_session] += opus.size.to_u64
+      log_media_debug if debug?
     end
 
     private def add_speaker_track(session : UInt32, mid : String)
@@ -168,7 +178,38 @@ module Wumble
       packetizer.payload_type = 111_u8
       packetizer.clock_rate = 48_000_u32
       check LibDataChannel.rtc_set_opus_packetizer(track, pointerof(packetizer))
+      STDERR.puts "WebRTC: added Opus track session=#{session} mid=#{mid} track=#{track} ssrc=#{session} payload_type=111" if debug?
       @tracks[session] = track
+    end
+
+    # libdatachannel has no C API for outbound RTP counters. These values show
+    # whether it accepted encoded Opus samples and whether they are stuck in a
+    # track's send buffer; the selected ICE addresses identify the packet path
+    # to inspect with tcpdump.
+    private def log_media_debug
+      now = Time.instant
+      return if now - @last_debug_at < 5.seconds
+      @last_debug_at = now
+      local_address = rtc_address { |buffer, size| LibDataChannel.rtc_get_local_address(@pc, buffer, size) }
+      remote_address = rtc_address { |buffer, size| LibDataChannel.rtc_get_remote_address(@pc, buffer, size) }
+      candidate_local = Bytes.new(256, 0_u8)
+      candidate_remote = Bytes.new(256, 0_u8)
+      pair_result = LibDataChannel.rtc_get_selected_candidate_pair(@pc, candidate_local.to_unsafe, candidate_local.size, candidate_remote.to_unsafe, candidate_remote.size)
+      pair = pair_result >= 0 ? "#{String.new(candidate_local.to_unsafe)} -> #{String.new(candidate_remote.to_unsafe)}" : "unavailable (#{pair_result})"
+      tracks = @tracks.map do |session, track|
+        "session=#{session} track=#{track} open=#{LibDataChannel.rtc_is_open(track)} samples=#{@sent_packets[session]} bytes=#{@sent_bytes[session]} buffered=#{LibDataChannel.rtc_get_buffered_amount(track)}"
+      end
+      STDERR.puts "WebRTC debug: local=#{local_address} remote=#{remote_address} candidate_pair=#{pair}; #{tracks.join("; ")}"
+    end
+
+    private def rtc_address(&)
+      buffer = Bytes.new(256, 0_u8)
+      result = yield buffer.to_unsafe, buffer.size
+      result >= 0 ? String.new(buffer.to_unsafe) : "unavailable (#{result})"
+    end
+
+    private def debug? : Bool
+      ENV["WUMBLE_DEBUG"]? == "1"
     end
 
     private def check(result : Int32)
