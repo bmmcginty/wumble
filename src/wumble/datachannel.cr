@@ -30,7 +30,30 @@ lib LibDataChannel
   fun rtc_set_remote_description = rtcSetRemoteDescription(pc : Handle, sdp : UInt8*, type : UInt8*) : Int32
   fun rtc_add_remote_candidate = rtcAddRemoteCandidate(pc : Handle, candidate : UInt8*, mid : UInt8*) : Int32
   fun rtc_get_local_description = rtcGetLocalDescription(pc : Handle, buffer : UInt8*, size : Int32) : Int32
+  struct PacketizerInit
+    ssrc : UInt32
+    cname : UInt8*
+    payload_type : UInt8
+    clock_rate : UInt32
+    sequence_number : UInt16
+    timestamp : UInt32
+    max_fragment_size : UInt16
+    nal_separator : Int32
+    obu_packetization : Int32
+    playout_delay_id : UInt8
+    playout_delay_min : UInt16
+    playout_delay_max : UInt16
+    color_space_id : UInt8
+    color_chroma_siting_horz : UInt8
+    color_chroma_siting_vert : UInt8
+    color_range : UInt8
+    color_primaries : UInt8
+    color_transfer : UInt8
+    color_matrix : UInt8
+  end
+
   fun rtc_add_track = rtcAddTrack(pc : Handle, sdp : UInt8*) : Handle
+  fun rtc_set_opus_packetizer = rtcSetOpusPacketizer(track : Handle, init : PacketizerInit*) : Int32
   fun rtc_send_message = rtcSendMessage(track : Handle, data : UInt8*, size : Int32) : Int32
   fun rtc_is_open = rtcIsOpen(id : Handle) : Bool
 end
@@ -42,8 +65,6 @@ module Wumble
     @speakers = Set(UInt32).new
     @pending_audio = Hash(UInt32, Array(Bytes)).new { |sessions, session| sessions[session] = [] of Bytes }
     @remote_description_set = false
-    @sequence = Hash(UInt32, UInt16).new(0_u16)
-    @timestamp = Hash(UInt32, UInt32).new(0_u32)
 
     def initialize
       # Ask libdatachannel to print native error diagnostics to stderr/stdout;
@@ -123,17 +144,12 @@ module Wumble
       end
     end
 
-    private def forward_opus(session : UInt32, track : LibDataChannel::Handle, opus : Bytes)
-      sequence = @sequence[session] += 1
-      timestamp = @timestamp[session] += 960 # 20 ms at Opus' 48 kHz RTP clock
-      rtp = Bytes.new(12 + opus.size)
-      rtp[0] = 0x80_u8
-      rtp[1] = 111_u8
-      IO::ByteFormat::BigEndian.encode(sequence, rtp[2, 2])
-      IO::ByteFormat::BigEndian.encode(timestamp, rtp[4, 4])
-      IO::ByteFormat::BigEndian.encode(session, rtp[8, 4])
-      rtp[12, opus.size].copy_from(opus)
-      check LibDataChannel.rtc_send_message(track, rtp.to_unsafe, rtp.size)
+    private def forward_opus(_session : UInt32, track : LibDataChannel::Handle, opus : Bytes)
+      # The Opus packetizer constructs RTP headers and derives each packet's
+      # duration from its TOC. Mumble packets are not necessarily 20 ms, so
+      # incrementing a hand-built RTP timestamp by a fixed 960 samples makes
+      # the browser discard or misplay streams with another frame duration.
+      check LibDataChannel.rtc_send_message(track, opus.to_unsafe, opus.size)
     end
 
     private def add_speaker_track(session : UInt32, mid : String)
@@ -142,6 +158,16 @@ module Wumble
       sdp = "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:#{mid}\r\na=sendonly\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1\r\na=ssrc:#{session} cname:wumble-#{session}\r\n"
       track = LibDataChannel.rtc_add_track(@pc, sdp.to_unsafe)
       raise "rtcAddTrack failed (#{track})" if track < 0
+      # rtcSendMessage sends encoded Opus samples through this packetizer. It
+      # must own the RTP sequence and timestamp so the generated stream agrees
+      # with its negotiated SSRC and correctly represents variable durations.
+      cname = "wumble-#{session}"
+      packetizer = LibDataChannel::PacketizerInit.new
+      packetizer.ssrc = session
+      packetizer.cname = cname.to_unsafe
+      packetizer.payload_type = 111_u8
+      packetizer.clock_rate = 48_000_u32
+      check LibDataChannel.rtc_set_opus_packetizer(track, pointerof(packetizer))
       @tracks[session] = track
     end
 
