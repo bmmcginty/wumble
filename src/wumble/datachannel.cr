@@ -44,7 +44,7 @@ module Wumble
     getter pc : LibDataChannel::Handle
     @tracks = Hash(UInt32, LibDataChannel::Handle).new
     @speakers = Set(UInt32).new
-    @pending_audio = Hash(UInt32, Array(Bytes)).new { |sessions, session| sessions[session] = [] of Bytes }
+    @dropped_packets = Hash(UInt32, UInt64).new(0_u64)
     @sent_packets = Hash(UInt32, UInt64).new(0_u64)
     @sent_bytes = Hash(UInt32, UInt64).new(0_u64)
     @opus_payload_types = Hash(String, UInt8).new
@@ -103,37 +103,24 @@ module Wumble
 
     # One sendonly RTP track is created for every Mumble session. This is the
     # important boundary: no decoder, mixer, or shared browser MediaStream exists.
+    # Live voice takes priority over continuity, so packets produced before a
+    # track is open are discarded rather than creating a stale playout backlog.
     def send_opus(session : UInt32, opus : Bytes)
       prepare_speaker(session)
       if track = @tracks[session]?
         if LibDataChannel.rtc_is_open(track)
-          flush_pending(session, track)
           forward_opus(session, track, opus)
         else
-          queue_opus(session, opus)
+          @dropped_packets[session] += 1
         end
       else
-        queue_opus(session, opus)
+        @dropped_packets[session] += 1
       end
     end
 
     def close
       LibDataChannel.rtc_delete_peer_connection(@pc) if @pc >= 0
       @pc = -1
-    end
-
-    private def queue_opus(session : UInt32, opus : Bytes)
-      packets = @pending_audio[session]
-      packets.shift if packets.size >= 50
-      packets << opus.dup
-      STDERR.puts "WebRTC: queued Opus packet for session #{session} until its track is open"
-    end
-
-    private def flush_pending(session : UInt32, track : LibDataChannel::Handle)
-      if packets = @pending_audio.delete(session)
-        STDERR.puts "WebRTC: forwarding #{packets.size} queued Opus packets for session #{session}"
-        packets.each { |opus| forward_opus(session, track, opus) }
-      end
     end
 
     private def forward_opus(session : UInt32, track : LibDataChannel::Handle, opus : Bytes)
@@ -241,7 +228,7 @@ module Wumble
       pair_result = LibDataChannel.rtc_get_selected_candidate_pair(@pc, candidate_local.to_unsafe, candidate_local.size, candidate_remote.to_unsafe, candidate_remote.size)
       pair = pair_result >= 0 ? "#{String.new(candidate_local.to_unsafe)} -> #{String.new(candidate_remote.to_unsafe)}" : "unavailable (#{pair_result})"
       tracks = @tracks.map do |session, track|
-        "session=#{session} track=#{track} open=#{LibDataChannel.rtc_is_open(track)} samples=#{@sent_packets[session]} bytes=#{@sent_bytes[session]} buffered=#{LibDataChannel.rtc_get_buffered_amount(track)}"
+        "session=#{session} track=#{track} open=#{LibDataChannel.rtc_is_open(track)} samples=#{@sent_packets[session]} bytes=#{@sent_bytes[session]} dropped=#{@dropped_packets[session]} buffered=#{LibDataChannel.rtc_get_buffered_amount(track)}"
       end
       STDERR.puts "WebRTC debug: local=#{local_address} remote=#{remote_address} candidate_pair=#{pair}; #{tracks.join("; ")}"
     end
