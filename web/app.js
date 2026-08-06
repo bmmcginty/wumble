@@ -123,8 +123,9 @@ window.addEventListener('unhandledrejection', ({ reason }) => {
   browserError('unhandled promise rejection', { reason: String(reason) });
 });
 
-async function captureMicrophone() {
-  if (microphoneStream?.active) return;
+async function captureMicrophone(restart = false) {
+  if (microphoneStream?.active && !restart) return;
+  if (restart) stopMicrophone();
   if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone capture is not supported by this browser');
   // This is intentionally requested inside the Connect tap. While Safari is
   // capturing a MediaStream, it permits the remote WebRTC audio to autoplay.
@@ -245,9 +246,18 @@ function scheduleReconnect() {
   const delay = Math.min(1_000 * (2 ** reconnectAttempts), 30_000);
   reconnectAttempts += 1;
   setStatus(`Disconnected; reconnecting in ${Math.round(delay / 1_000)} seconds…`);
-  reconnectTimer = window.setTimeout(() => {
+  reconnectTimer = window.setTimeout(async () => {
     reconnectTimer = undefined;
-    connectSignalling();
+    try {
+      // Reacquire instead of reusing the old track: iOS Safari can leave a
+      // track alive but no longer transmit it after its PeerConnection drops.
+      await captureMicrophone(true);
+      connectSignalling();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      browserError('microphone recapture failed', { message });
+      scheduleReconnect();
+    }
   }, delay);
 }
 
