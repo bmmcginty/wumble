@@ -10,6 +10,7 @@ module Wumble
     UDPTUNNEL     =  1
     AUTHENTICATE  =  2
     PING          =  3
+    REJECT        =  4
     SERVER_SYNC   =  5
     USER_STATE    =  9
     CODEC_VERSION = 21
@@ -25,10 +26,13 @@ module Wumble
     end
 
     def connect
+      STDERR.puts "Mumble: connecting to #{@host}:#{@port} as #{@username.inspect}"
       tcp = TCPSocket.new(@host, @port)
       @io = OpenSSL::SSL::Socket::Client.new(tcp, context: insecure_context)
+      STDERR.puts "Mumble: TLS connected"
+      # Version is itself the packet payload, not an embedded protobuf field.
       version = Protobuf.field(1, 0x010500_u64) + Protobuf.string(2, "Wumble") + Protobuf.string(3, "Crystal")
-      send_packet(VERSION, Protobuf.bytes(1, version))
+      send_packet(VERSION, version)
       authenticate
       spawn { read_loop }
     end
@@ -46,7 +50,7 @@ module Wumble
     end
 
     private def authenticate
-      packet = Protobuf.string(1, @username) + Protobuf.string(6, @password)
+      packet = Protobuf.string(1, @username) + Protobuf.string(2, @password)
       packet += Protobuf.field(5, 1_u64) # Opus
       send_packet(AUTHENTICATE, packet)
     end
@@ -56,6 +60,7 @@ module Wumble
       header = Bytes.new(6)
       IO::ByteFormat::BigEndian.encode(type.to_u16, header[0, 2])
       IO::ByteFormat::BigEndian.encode(payload.size.to_u32, header[2, 4])
+      STDERR.puts "Mumble: sent #{packet_name(type)} (#{payload.size} bytes)"
       io.write(header)
       io.write(payload)
       io.flush
@@ -71,13 +76,25 @@ module Wumble
         raise "Mumble control packet exceeds 8 MiB" if wire_size > 8_388_608_u32
         payload = Bytes.new(wire_size.to_i)
         io.read_fully(payload)
+        STDERR.puts "Mumble: received #{packet_name(type)} (#{payload.size} bytes)" unless type == UDPTUNNEL
         case type
-        when USER_STATE then update_user(payload)
-        when UDPTUNNEL  then receive_tunnel(payload)
+        when REJECT      then reject(payload)
+        when SERVER_SYNC then STDERR.puts "Mumble: authenticated and synchronized"
+        when USER_STATE  then update_user(payload)
+        when UDPTUNNEL   then receive_tunnel(payload)
         end
       end
     rescue ex
-      STDERR.puts "Mumble connection closed: #{ex.message}"
+      STDERR.puts "Mumble connection closed: #{ex.message || ex.class.name}"
+      STDERR.puts ex.backtrace.join('\n') if ENV["WUMBLE_DEBUG"]? == "1"
+    end
+
+    private def reject(payload : Bytes)
+      reason = nil
+      Protobuf.fields(payload) do |number, wire, value|
+        reason = String.new(value) if number == 2 && wire == 2
+      end
+      raise "Mumble rejected authentication#{reason ? ": #{reason}" : ""}"
     end
 
     private def update_user(payload : Bytes)
@@ -90,6 +107,20 @@ module Wumble
         end
       end
       @users[session.not_nil!] = name.not_nil! if session && name
+    end
+
+    private def packet_name(type : Int32)
+      case type
+      when VERSION       then "Version"
+      when UDPTUNNEL     then "UDPTunnel"
+      when AUTHENTICATE  then "Authenticate"
+      when PING          then "Ping"
+      when REJECT        then "Reject"
+      when SERVER_SYNC   then "ServerSync"
+      when USER_STATE    then "UserState"
+      when CODEC_VERSION then "CodecVersion"
+      else                    "control type #{type}"
+      end
     end
 
     private def receive_tunnel(packet : Bytes)
