@@ -87,7 +87,14 @@ module Wumble
       return unless crypt = @crypt
       return unless udp = @udp
       payload = Bytes[0_u8] + Protobuf.field(4, frame_number.to_u64) + Protobuf.bytes(5, opus)
-      udp.send(crypt.encrypt(payload))
+      datagram = crypt.encrypt(payload)
+      udp.send(datagram)
+      # UDPSocket#send returning means the kernel accepted the datagram. This
+      # is intentionally per-packet under debug so gateway-to-server timing
+      # can be compared directly with a UDP capture on the Mumble server.
+      if ENV["WUMBLE_DEBUG"]? == "1"
+        STDERR.puts "Mumble UDP voice queued at=#{Time.utc.to_unix_ms} frame=#{frame_number} opus_bytes=#{opus.size} datagram_bytes=#{datagram.size}"
+      end
     rescue ex
       STDERR.puts "Mumble UDP voice send failed: #{ex.message || ex.class.name}" unless @closed
     end
