@@ -33,6 +33,10 @@ module Wumble
           message_type = data["type"].as_s
           STDERR.puts "WebRTC signalling: received #{message_type}"
           case message_type
+          when "log"
+            event = data["event"]?.try(&.as_s) || "unknown client event"
+            details = data["details"]?.try(&.to_json) || "{}"
+            STDERR.puts "WebRTC client: #{event} #{details}"
           when "ping"
             socket.send({type: "pong"}.to_json)
           when "connect"

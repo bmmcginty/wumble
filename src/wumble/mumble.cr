@@ -160,6 +160,7 @@ module Wumble
       when USER_STATE    then "UserState"
       when CRYPT_SETUP   then "CryptSetup"
       when CODEC_VERSION then "CodecVersion"
+      when 24            then "ServerConfig"
       else                    "control type #{type}"
       end
     end
@@ -168,7 +169,10 @@ module Wumble
       # UDPTunnel carries the normal encrypted UDP datagram. Decrypt it before
       # extracting the Opus frame, but never decode or mix that frame.
       plaintext = @crypt.try &.decrypt(packet)
-      return unless plaintext
+      unless plaintext
+        STDERR.puts "Mumble: discarded UDPTunnel packet (crypt authentication or sequence check failed)" if ENV["WUMBLE_DEBUG"]? == "1"
+        return
+      end
       packet = plaintext
       return if packet.empty? || (packet[0] >> 5) != 4 # UDPVoiceOpus
       offset = 1
@@ -179,7 +183,9 @@ module Wumble
       size &= 0x1fff_u64 # Mumble's high bit is the end-of-transmission marker.
       return if offset > packet.size || size > (packet.size - offset).to_u64
       finish = offset + size.to_i
-      @on_voice.try &.call(session.to_u32, packet[offset...finish])
+      opus = packet[offset...finish]
+      STDERR.puts "Mumble: forwarding #{opus.size}-byte Opus packet from session #{session}"
+      @on_voice.try &.call(session.to_u32, opus)
     end
   end
 end
