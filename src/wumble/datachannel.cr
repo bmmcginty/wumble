@@ -33,32 +33,8 @@ lib LibDataChannel
   fun rtc_get_local_address = rtcGetLocalAddress(pc : Handle, buffer : UInt8*, size : Int32) : Int32
   fun rtc_get_remote_address = rtcGetRemoteAddress(pc : Handle, buffer : UInt8*, size : Int32) : Int32
   fun rtc_get_selected_candidate_pair = rtcGetSelectedCandidatePair(pc : Handle, local : UInt8*, local_size : Int32, remote : UInt8*, remote_size : Int32) : Int32
-  struct PacketizerInit
-    ssrc : UInt32
-    cname : UInt8*
-    payload_type : UInt8
-    clock_rate : UInt32
-    sequence_number : UInt16
-    timestamp : UInt32
-    max_fragment_size : UInt16
-    nal_separator : Int32
-    obu_packetization : Int32
-    playout_delay_id : UInt8
-    playout_delay_min : UInt16
-    playout_delay_max : UInt16
-    color_space_id : UInt8
-    color_chroma_siting_horz : UInt8
-    color_chroma_siting_vert : UInt8
-    color_range : UInt8
-    color_primaries : UInt8
-    color_transfer : UInt8
-    color_matrix : UInt8
-  end
-
   fun rtc_add_track = rtcAddTrack(pc : Handle, sdp : UInt8*) : Handle
-  fun rtc_set_opus_packetizer = rtcSetOpusPacketizer(track : Handle, init : PacketizerInit*) : Int32
   fun rtc_send_message = rtcSendMessage(track : Handle, data : UInt8*, size : Int32) : Int32
-  fun rtc_set_track_rtp_timestamp = rtcSetTrackRtpTimestamp(track : Handle, timestamp : UInt32) : Int32
   fun rtc_get_buffered_amount = rtcGetBufferedAmount(id : Handle) : Int32
   fun rtc_is_open = rtcIsOpen(id : Handle) : Bool
 end
@@ -72,7 +48,11 @@ module Wumble
     @sent_packets = Hash(UInt32, UInt64).new(0_u64)
     @sent_bytes = Hash(UInt32, UInt64).new(0_u64)
     @opus_payload_types = Hash(String, UInt8).new
+    @mid_extension_ids = Hash(String, UInt8).new
+    @track_mids = Hash(UInt32, String).new
+    @sequence = Hash(UInt32, UInt16).new(0_u16)
     @timestamp = Hash(UInt32, UInt32).new(0_u32)
+    @first_packet = Hash(UInt32, Bool).new(true)
     @last_debug_at = Time.instant
     @remote_description_set = false
 
@@ -89,6 +69,7 @@ module Wumble
 
     def accept_offer(sdp : String)
       @opus_payload_types = opus_payload_types(sdp)
+      @mid_extension_ids = mid_extension_ids(sdp)
       result = LibDataChannel.rtc_set_remote_description(@pc, sdp.to_unsafe, "offer".to_unsafe)
       raise "rtcSetRemoteDescription failed (#{result})" if result < 0
       @remote_description_set = true
@@ -156,13 +137,32 @@ module Wumble
     end
 
     private def forward_opus(session : UInt32, track : LibDataChannel::Handle, opus : Bytes)
-      # OpusPacketizer serializes the RTP header but does not advance its
-      # timestamp. A constant timestamp makes a browser treat every packet as
-      # part of one frame and discard the stream. Supply the timestamp before
-      # every sample and advance it by the duration encoded in the Opus TOC.
-      check LibDataChannel.rtc_set_track_rtp_timestamp(track, @timestamp[session])
-      check LibDataChannel.rtc_send_message(track, opus.to_unsafe, opus.size)
+      mid = @track_mids[session]
+      payload_type = @opus_payload_types[mid]
+      # BUNDLE requires the MID extension to associate an RTP SSRC with its
+      # m= section. libdatachannel's C Opus packetizer omits it, so construct
+      # the small RTP header here and send it directly to the track.
+      mid_extension_id = @mid_extension_ids[mid]?
+      extension_size = mid_extension_id ? 4 + ((1 + mid.bytesize + 3) // 4) * 4 : 0
+      rtp = Bytes.new(12 + extension_size + opus.size)
+      rtp[0] = mid_extension_id ? 0x90_u8 : 0x80_u8
+      rtp[1] = payload_type | (@first_packet[session] ? 0x80_u8 : 0_u8)
+      IO::ByteFormat::BigEndian.encode(@sequence[session], rtp[2, 2])
+      IO::ByteFormat::BigEndian.encode(@timestamp[session], rtp[4, 4])
+      IO::ByteFormat::BigEndian.encode(session, rtp[8, 4])
+      payload_offset = 12
+      if extension_id = mid_extension_id
+        IO::ByteFormat::BigEndian.encode(0xbede_u16, rtp[payload_offset, 2])
+        IO::ByteFormat::BigEndian.encode((extension_size - 4).to_u16 // 4, rtp[payload_offset + 2, 2])
+        rtp[payload_offset + 4] = (extension_id << 4) | (mid.bytesize - 1).to_u8
+        rtp[payload_offset + 5, mid.bytesize].copy_from(mid.to_slice)
+        payload_offset += extension_size
+      end
+      rtp[payload_offset, opus.size].copy_from(opus)
+      check LibDataChannel.rtc_send_message(track, rtp.to_unsafe, rtp.size)
+      @sequence[session] &+= 1_u16
       @timestamp[session] &+= opus_duration_samples(opus)
+      @first_packet[session] = false
       @sent_packets[session] += 1
       @sent_bytes[session] += opus.size.to_u64
       log_media_debug if debug?
@@ -178,18 +178,22 @@ module Wumble
       sdp = "m=audio 9 UDP/TLS/RTP/SAVPF #{payload_type}\r\na=mid:#{mid}\r\na=sendonly\r\na=rtpmap:#{payload_type} opus/48000/2\r\na=fmtp:#{payload_type} minptime=10;useinbandfec=1\r\na=ssrc:#{session} cname:wumble-#{session}\r\n"
       track = LibDataChannel.rtc_add_track(@pc, sdp.to_unsafe)
       raise "rtcAddTrack failed (#{track})" if track < 0
-      # rtcSendMessage sends encoded Opus samples through this packetizer. It
-      # must own the RTP sequence and timestamp so the generated stream agrees
-      # with its negotiated SSRC and correctly represents variable durations.
-      cname = "wumble-#{session}"
-      packetizer = LibDataChannel::PacketizerInit.new
-      packetizer.ssrc = session
-      packetizer.cname = cname.to_unsafe
-      packetizer.payload_type = payload_type
-      packetizer.clock_rate = 48_000_u32
-      check LibDataChannel.rtc_set_opus_packetizer(track, pointerof(packetizer))
-      STDERR.puts "WebRTC: added Opus track session=#{session} mid=#{mid} track=#{track} ssrc=#{session} payload_type=#{payload_type}" if debug?
+      STDERR.puts "WebRTC: added Opus track session=#{session} mid=#{mid} track=#{track} ssrc=#{session} payload_type=#{payload_type} mid_extension=#{@mid_extension_ids[mid]?}" if debug?
       @tracks[session] = track
+      @track_mids[session] = mid
+    end
+
+    private def mid_extension_ids(sdp : String) : Hash(String, UInt8)
+      extension_ids = Hash(String, UInt8).new
+      sdp.split("\nm=").each do |section|
+        next unless section.starts_with?("audio ")
+        mid = section.match(/(?:\A|\n)a=mid:([^\r\n]+)/).try(&.[1])
+        extension = section.match(/(?:\A|\n)a=extmap:(\d+)(?:\/[^\s]+)?\s+urn:ietf:params:rtp-hdrext:sdes:mid/i).try(&.[1])
+        next unless mid && extension
+        extension_id = extension.to_u8?
+        extension_ids[mid] = extension_id if extension_id && extension_id > 0 && extension_id < 15
+      end
+      extension_ids
     end
 
     private def opus_duration_samples(opus : Bytes) : UInt32
