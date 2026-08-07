@@ -61,16 +61,16 @@ module Wumble
                 peer.not_nil!.on_opus { |opus, frame_number| mumble.not_nil!.send_opus(opus, frame_number) }
                 connection.channel_users.each_key { |speaker| peer.not_nil!.prepare_speaker(speaker) }
                 socket.send({type: "restart_webrtc", speakers: connection.channel_users.size}.to_json)
+              elsif prepare_channel_speakers(peer.not_nil!, connection)
+                # A UserState update can contain only a channel change and no
+                # name. Reconcile the complete channel membership here rather
+                # than relying on the name-bearing on_user callback, so an
+                # already-connected browser is offered a track for every
+                # newcomer.
+                STDERR.puts "WebRTC signalling: requesting renegotiation for new channel speaker"
+                socket.send({type: "renegotiate"}.to_json)
               end
               active_channel = channel if channel
-            end
-            mumble.not_nil!.on_user do |speaker, _name|
-              connection = mumble.not_nil!
-              if channel = connection.current_channel
-                if connection.user_channels[speaker]? == channel
-                  socket.send({type: "renegotiate"}.to_json) if peer.not_nil!.prepare_speaker(speaker)
-                end
-              end
             end
             mumble.not_nil!.on_voice { |speaker, opus, frame_number| peer.not_nil!.send_opus(speaker, opus, frame_number) }
             mumble.not_nil!.on_voice_end { |speaker| peer.not_nil!.end_voice(speaker) }
@@ -148,6 +148,17 @@ module Wumble
         mumble.try &.close
         peer.try &.close
       end
+    end
+
+    # Returns true only when Peer needs the browser to offer another audio
+    # section. prepare_speaker coalesces simultaneous joins while one
+    # renegotiation is already pending.
+    private def prepare_channel_speakers(peer : Peer, mumble : MumbleConnection) : Bool
+      needs_renegotiation = false
+      mumble.channel_users.each_key do |speaker|
+        needs_renegotiation = peer.prepare_speaker(speaker) || needs_renegotiation
+      end
+      needs_renegotiation
     end
 
     private def channel_state(mumble : MumbleConnection)
