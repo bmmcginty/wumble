@@ -105,9 +105,21 @@ module Wumble
             STDERR.puts "WebRTC signalling: accepted browser offer; waiting for local answer"
             spawn do
               begin
-                # Give ICE gathering time to add host candidates to the SDP.
-                sleep 1.second
-                answer = current_peer.local_description || raise "libdatachannel did not produce an answer"
+                # libdatachannel does not expose a Crystal-safe local-candidate
+                # callback. Poll only until its host candidate reaches the SDP,
+                # instead of imposing a one-second delay on every connection.
+                deadline = Time.instant + 250.milliseconds
+                answer = nil.as(String?)
+                loop do
+                  if local_description = current_peer.local_description
+                    answer = local_description
+                    break if local_description.includes?("a=candidate:")
+                  end
+                  break if Time.instant >= deadline
+                  sleep 10.milliseconds
+                end
+                answer ||= raise "libdatachannel did not produce an answer"
+                STDERR.puts "WebRTC signalling: local ICE candidate was not ready after 250 ms; sending available answer" unless answer.includes?("a=candidate:")
                 speakers = current_peer.speaker_mids.map do |session, mid|
                   {session: session, mid: mid, name: mumble.not_nil!.users[session]? || "Session #{session}"}
                 end
