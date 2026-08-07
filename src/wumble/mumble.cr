@@ -393,7 +393,14 @@ module Wumble
       end
       if session
         @users[session.not_nil!] = name.not_nil! if name
-        @user_channels[session.not_nil!] = channel.not_nil! if channel
+        if channel
+          @user_channels[session.not_nil!] = channel.not_nil!
+        elsif !@user_channels.has_key?(session.not_nil!)
+          # Murmur omits channel_id for Root (channel 0) users in its
+          # initial UserState snapshot. Later partial updates likewise omit
+          # it, but must retain the channel already recorded for that user.
+          @user_channels[session.not_nil!] = 0_u32
+        end
         @on_user.try &.call(session.not_nil!, name.not_nil!) if name
         @on_state.try &.call
       end
