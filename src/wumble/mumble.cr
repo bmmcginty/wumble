@@ -3,6 +3,32 @@ require "openssl"
 require "./protobuf"
 require "./crypt_state"
 
+def bytes_repr(bytes : Bytes)
+  String.build do |io|
+    bytes.each do |b|
+      case b
+      when 0x20..0x7e
+        case b
+        when '\\'.ord
+          io << "\\\\"
+        when '"'.ord
+          io << "\\\""
+        else
+          io << b.chr
+        end
+      when '\n'.ord
+        io << "\\n"
+      when '\r'.ord
+        io << "\\r"
+      when '\t'.ord
+        io << "\\t"
+      else
+        io << "\\x%02x" % b
+      end
+    end
+  end
+end
+
 module Wumble
   # Mumble's TCP control protocol. Voice is intentionally accepted separately by
   # UdpVoice; TCP packets are not mixed or decoded by this class.
@@ -180,13 +206,16 @@ module Wumble
         payload = Bytes.new(wire_size.to_i)
         io.read_fully(payload)
         STDERR.puts "Mumble: received #{packet_name(type)} (#{payload.size} bytes)" unless type == UDPTUNNEL
+        if ENV["WUMBLE_DEBUG"]? == "1"
+          STDERR.puts "#{bytes_repr(payload)}"
+        end
         case type
-        when REJECT then reject(payload)
+        when REJECT        then reject(payload)
         when SERVER_SYNC   then synchronize(payload)
         when CHANNEL_STATE then update_channel(payload)
         when USER_STATE    then update_user(payload)
-        when USER_REMOVE then user_removed(payload)
-        when CRYPT_SETUP then configure_crypt(payload)
+        when USER_REMOVE   then user_removed(payload)
+        when CRYPT_SETUP   then configure_crypt(payload)
           # Native encrypted UDP is required for voice. Do not feed the TCP
           # fallback into WebRTC, where its head-of-line blocking adds latency.
         when UDPTUNNEL
