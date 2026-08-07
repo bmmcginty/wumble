@@ -188,6 +188,17 @@ async function captureMicrophone(restart = false) {
     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     video: false,
   });
+  const audioTrack = microphoneStream.getAudioTracks()[0];
+  if (audioTrack) {
+    audioTrack.onmute = () => {
+      browserLog('microphone muted by system (iOS interruption)');
+      audioTrack.enabled = false;
+    };
+    audioTrack.onunmute = () => {
+      browserLog('microphone unmuted by system');
+      audioTrack.enabled = true;
+    };
+  }
   browserLog('microphone capture enabled');
 }
 
