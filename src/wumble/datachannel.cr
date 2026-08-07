@@ -51,6 +51,14 @@ module Wumble
     @speakers = Set(UInt32).new
     @dropped_packets = Hash(UInt32, UInt64).new(0_u64)
     @sent_packets = Hash(UInt32, UInt64).new(0_u64)
+    # These counters are updated in the Mumble UDP receive fiber but emitted
+    # only as five-second summaries. Never write a log line per voice packet:
+    # doing so can itself create the scheduling jitter we are trying to find.
+    @voice_received_packets = Hash(UInt32, UInt64).new(0_u64)
+    @voice_received_bytes = Hash(UInt32, UInt64).new(0_u64)
+    @voice_forwarded_packets = Hash(UInt32, UInt64).new(0_u64)
+    @voice_dropped_unassigned = Hash(UInt32, UInt64).new(0_u64)
+    @voice_dropped_unopened = Hash(UInt32, UInt64).new(0_u64)
     @sent_bytes = Hash(UInt32, UInt64).new(0_u64)
     @opus_payload_types = Hash(String, UInt8).new
     @mid_extension_ids = Hash(String, UInt8).new
@@ -61,6 +69,7 @@ module Wumble
     @timestamp = Hash(UInt32, UInt32).new(0_u32)
     @first_packet = Hash(UInt32, Bool).new(true)
     @receiver_fd : Int32
+    @media_debug : Bool
     @next_mumble_frame = Hash(UInt32, UInt32).new
     @mumble_packet_frames = Hash(UInt32, UInt32).new
     @last_debug_at = Time.instant
@@ -81,6 +90,7 @@ module Wumble
       @browser_pipe_delay_total_ms = 0_u64
       @browser_pipe_delay_max_ms = 0_u32
       @closed = false
+      @media_debug = ENV["WUMBLE_DEBUG"]? == "1"
       @pc = LibDataChannel.rtc_create_peer_connection(pointerof(config))
       raise "rtcCreatePeerConnection failed" if @pc < 0
       receiver_fd = LibDataChannel.wumble_receiver_start(@pc)
@@ -88,6 +98,7 @@ module Wumble
       @receiver_fd = receiver_fd
       spawn { receive_browser_audio }
       spawn { log_browser_receiver_debug }
+      spawn { log_mumble_voice_batches }
     end
 
     def on_opus(&block : Bytes, UInt32 ->)
@@ -147,11 +158,14 @@ module Wumble
       if track = @tracks[session]?
         if LibDataChannel.rtc_is_open(track)
           forward_opus(session, track, opus, frame_number)
+          record_mumble_voice(session, opus.size, :forwarded)
         else
           @dropped_packets[session] += 1
+          record_mumble_voice(session, opus.size, :unopened)
         end
       else
         @dropped_packets[session] += 1
+        record_mumble_voice(session, opus.size, :unassigned)
       end
     end
 
@@ -185,6 +199,35 @@ module Wumble
         @browser_pipe_delay_packets = 0_u64
         @browser_pipe_delay_total_ms = 0_u64
         @browser_pipe_delay_max_ms = 0_u32
+      end
+    end
+
+    private def record_mumble_voice(session : UInt32, bytes : Int32, result : Symbol)
+      return unless debug?
+      @voice_received_packets[session] += 1
+      @voice_received_bytes[session] += bytes.to_u64
+      case result
+      when :forwarded  then @voice_forwarded_packets[session] += 1
+      when :unassigned then @voice_dropped_unassigned[session] += 1
+      when :unopened   then @voice_dropped_unopened[session] += 1
+      end
+    end
+
+    private def log_mumble_voice_batches
+      until @closed
+        sleep 5.seconds
+        break if @closed
+        next unless debug?
+        next if @voice_received_packets.empty?
+        sessions = @voice_received_packets.keys.sort.map do |session|
+          "session=#{session} received=#{@voice_received_packets[session]} bytes=#{@voice_received_bytes[session]} forwarded=#{@voice_forwarded_packets[session]} dropped_unassigned=#{@voice_dropped_unassigned[session]} dropped_unopened=#{@voice_dropped_unopened[session]}"
+        end
+        @voice_received_packets.clear
+        @voice_received_bytes.clear
+        @voice_forwarded_packets.clear
+        @voice_dropped_unassigned.clear
+        @voice_dropped_unopened.clear
+        STDERR.puts "Mumble-to-WebRTC voice batch (5s): #{sessions.join("; ")}"
       end
     end
 
@@ -423,7 +466,7 @@ module Wumble
     end
 
     private def debug? : Bool
-      ENV["WUMBLE_DEBUG"]? == "1"
+      @media_debug
     end
 
     private def check(result : Int32)

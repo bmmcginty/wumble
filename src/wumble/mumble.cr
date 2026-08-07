@@ -209,9 +209,24 @@ module Wumble
         @session = session.to_u32 if session <= UInt32::MAX
       end
       STDERR.puts "Mumble: authenticated and synchronized"
+      log_server_sync_snapshot
       @synchronized = true
       @on_ready.try &.call
       @on_state.try &.call
+    end
+
+    # ServerSync is the one small, non-batched diagnostic: it records exactly
+    # which same-channel speakers are eligible to be bridged after reconnect.
+    # Per-voice diagnostics are batched by Peer instead.
+    private def log_server_sync_snapshot
+      channel = current_channel
+      channel_label = if channel
+                        "#{channel}(#{@channels[channel]? || "unknown"})"
+                      else
+                        "none"
+                      end
+      members = channel_users.map { |member_session, name| "#{member_session}:#{name}" }.join(", ")
+      STDERR.puts "Mumble: ServerSync snapshot self_session=#{@session || "unknown"} channel=#{channel_label} members=[#{members}]"
     end
 
     private def user_removed(payload : Bytes)
