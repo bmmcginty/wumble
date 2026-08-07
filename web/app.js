@@ -158,6 +158,7 @@ channelSelect.addEventListener('change', () => {
   if (connectionActive && channelSelect.value) signal({ type: 'switch_channel', channel: Number(channelSelect.value) });
 });
 function browserLog(event, details = {}) {
+  details.time = Date.now();
   console.info(`Wumble: ${event}`, details);
   if (socket?.readyState === WebSocket.OPEN) signal({ type: 'log', event, details });
 }
