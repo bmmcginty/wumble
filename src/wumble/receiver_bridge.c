@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
 #include <sys/uio.h>
@@ -23,14 +24,51 @@ typedef struct {
     _Atomic uint64_t queued;
 } wumble_receiver;
 
+/*
+ * Timestamped logger for libdatachannel so its internal messages can be
+ * correlated with the receiver_bridge diagnostics below.
+ */
+static void log_callback(rtcLogLevel level, const char *message) {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    int64_t ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+
+    const char *level_str = "?";
+    switch (level) {
+    case RTC_LOG_NONE:    level_str = "NONE";    break;
+    case RTC_LOG_FATAL:   level_str = "FATAL";   break;
+    case RTC_LOG_ERROR:   level_str = "ERROR";   break;
+    case RTC_LOG_WARNING: level_str = "WARN";    break;
+    case RTC_LOG_INFO:    level_str = "INFO";    break;
+    case RTC_LOG_DEBUG:   level_str = "DEBUG";   break;
+    case RTC_LOG_VERBOSE: level_str = "VERBOSE"; break;
+    }
+    fprintf(stderr, "[%lld] libdatachannel %-7s %s\n", (long long)ms, level_str, message);
+}
+
+void wumble_init_logger(void) {
+    rtcInitLogger(RTC_LOG_DEBUG, log_callback);
+}
+
 static void on_message(int track, const char *message, int size, void *ptr) {
-    (void)track;
     wumble_receiver *receiver = ptr;
     /* Keep the entire record within PIPE_BUF so concurrent callback writes are
      * atomic. The timestamp lets Crystal measure native-callback-to-forward
      * delay rather than merely counting queued packets. */
     if (!receiver || size <= 0 || size > 4090) return;
     atomic_fetch_add(&receiver->received, 1);
+    /* Diagnostic: log first 8 bytes with a timestamp so we can correlate
+     * with the libdatachannel debug stream above. */
+    {
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        int64_t ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+        char hex[17] = "";
+        for (int i = 0; i < size && i < 8; i++)
+            snprintf(hex + i * 2, 3, "%02x", (unsigned char)message[i]);
+        fprintf(stderr, "[%lld] receiver_bridge track=%d size=%d first8=%s\n",
+                (long long)ms, track, size, hex);
+    }
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
     uint16_t length = htons((uint16_t)size);

@@ -26,6 +26,7 @@ lib LibDataChannel
   end
 
   fun rtc_init_logger = rtcInitLogger(level : Int32, callback : Void*)
+  fun wumble_init_logger = wumble_init_logger()
   fun rtc_create_peer_connection = rtcCreatePeerConnection(config : Configuration*) : Handle
   fun rtc_delete_peer_connection = rtcDeletePeerConnection(pc : Handle)
   fun rtc_set_remote_description = rtcSetRemoteDescription(pc : Handle, sdp : UInt8*, type : UInt8*) : Int32
@@ -77,9 +78,10 @@ module Wumble
     @renegotiation_pending = false
 
     def initialize
-      # Ask libdatachannel to print native error diagnostics to stderr/stdout;
-      # callbacks from its C++ threads are unsafe in Crystal.
-      LibDataChannel.rtc_init_logger(3, Pointer(Void).null)
+      # Configure libdatachannel debug logging with timestamps so its
+      # internal RTP/RTCP processing can be correlated with our bridge
+      # diagnostics (see receiver_bridge.c log_callback).
+      LibDataChannel.wumble_init_logger
       # libdatachannel requires a real (zero-initialized) configuration to use
       # its defaults; passing NULL segfaults in libdatachannel 0.24.
       config = LibDataChannel::Configuration.new
