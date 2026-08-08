@@ -113,7 +113,7 @@ async function requestWakeLock() {
   if (!connectionActive || document.visibilityState !== 'visible' || !navigator.wakeLock?.request || wakeLock) return;
   try {
     wakeLock = await navigator.wakeLock.request('screen');
-    wakeLock.addEventListener('release', () => { wakeLock = undefined; });
+    wakeLock.addEventListener('release', () => { wakeLock = undefined; void requestWakeLock(); });
     browserLog('screen wake lock enabled');
   } catch (error) {
     browserLog('screen wake lock unavailable', { message: String(error) });
