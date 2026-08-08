@@ -47,7 +47,7 @@ static void log_callback(rtcLogLevel level, const char *message) {
 }
 
 void wumble_init_logger(void) {
-    rtcInitLogger(RTC_LOG_DEBUG, log_callback);
+    rtcInitLogger(RTC_LOG_VERBOSE, log_callback);
 }
 
 static void on_message(int track, const char *message, int size, void *ptr) {
@@ -91,6 +91,26 @@ static void on_track(int pc, int track, void *ptr) {
     wumble_receiver *receiver = ptr;
     rtcSetUserPointer(track, receiver);
     rtcSetMessageCallback(track, on_message);
+
+    /* Log the track's media description so we know what codecs and payload
+     * types libdatachannel has negotiated for it. */
+    char desc[4096] = "";
+    char mid[64] = "";
+    rtcDirection dir = RTC_DIRECTION_UNKNOWN;
+    rtcGetTrackDescription(track, desc, sizeof(desc));
+    rtcGetTrackMid(track, mid, sizeof(mid));
+    rtcGetTrackDirection(track, &dir);
+
+    int pt_buf[32];
+    int pt_count = rtcGetTrackPayloadTypesForCodec(track, "opus", pt_buf, 32);
+    fprintf(stderr, "receiver_bridge: track=%d mid=\"%s\" dir=%d payload_types_opus_count=%d desc=\"%s\"\n",
+            track, mid, (int)dir, pt_count >= 0 ? pt_count : -1, desc);
+    if (pt_count > 0) {
+        fprintf(stderr, "receiver_bridge: track=%d opus_payload_types: ", track);
+        for (int i = 0; i < pt_count; i++)
+            fprintf(stderr, "%d ", pt_buf[i]);
+        fprintf(stderr, "\n");
+    }
 }
 
 int wumble_receiver_start(int pc) {

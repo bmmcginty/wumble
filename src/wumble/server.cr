@@ -70,7 +70,9 @@ module Wumble
               socket.send({type: type, message: reason}.to_json)
             end
             peer.not_nil!.on_opus do |opus, frame_number|
-              mumble.not_nil!.send_opus(opus, frame_number)
+              if mute_log_mutex.synchronize { mute_log.nil? }
+                mumble.not_nil!.send_opus(opus, frame_number)
+              end
               mute_log_mutex.synchronize do
                 if log = mute_log
                   log.print(opus.hexstring)
@@ -87,7 +89,9 @@ module Wumble
                 peer.try &.close
                 peer = Peer.new
                 peer.not_nil!.on_opus do |opus, frame_number|
-                  mumble.not_nil!.send_opus(opus, frame_number)
+                  if mute_log_mutex.synchronize { mute_log.nil? }
+                    mumble.not_nil!.send_opus(opus, frame_number)
+                  end
                   mute_log_mutex.synchronize do
                     if log = mute_log
                       log.print(opus.hexstring)
