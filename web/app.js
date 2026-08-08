@@ -109,25 +109,42 @@ function startMediaStats() {
 }
 
 function setStatus(text) { status.textContent = text; }
-async function requestWakeLock() {
-  if (!connectionActive || document.visibilityState !== 'visible' || !navigator.wakeLock?.request || wakeLock) return;
+async function acquireWakeLock() {
+  if (!navigator.wakeLock?.request || wakeLock) return;
+  browserLog('screen wake lock requesting', { visibilityState: document.visibilityState, connectionActive, hasGesture: navigator.userActivation?.isActive });
   try {
     wakeLock = await navigator.wakeLock.request('screen');
-    wakeLock.addEventListener('release', () => { wakeLock = undefined; void requestWakeLock(); });
+    wakeLock.addEventListener('release', () => {
+      browserLog('screen wake lock released by system');
+      wakeLock = undefined;
+      void requestWakeLock();
+    });
     browserLog('screen wake lock enabled');
   } catch (error) {
-    browserLog('screen wake lock unavailable', { message: String(error) });
+    browserLog('screen wake lock unavailable', { message: String(error), name: error.name });
   }
+}
+async function requestWakeLock() {
+  if (!connectionActive) {
+    browserLog('screen wake lock skipped: not connected');
+    return;
+  }
+  if (document.visibilityState !== 'visible') {
+    browserLog('screen wake lock skipped: not visible', { visibilityState: document.visibilityState });
+    return;
+  }
+  await acquireWakeLock();
 }
 async function releaseWakeLock() {
   if (!wakeLock) return;
+  browserLog('screen wake lock releasing');
   const lock = wakeLock;
   wakeLock = undefined;
   await lock.release();
 }
 document.addEventListener('visibilitychange', () => {
+  browserLog('visibility change', { visibilityState: document.visibilityState });
   if (document.visibilityState === 'visible') void requestWakeLock();
-  else void releaseWakeLock();
 });
 window.addEventListener('focus', () => { void requestWakeLock(); });
 window.addEventListener('pagehide', () => { void releaseWakeLock(); });
@@ -198,6 +215,9 @@ async function captureMicrophone(restart = false) {
     audioTrack.onunmute = () => {
       audioTrack.enabled = true;
       browserLog('microphone unmuted by system', { muted: audioTrack.muted, enabled: audioTrack.enabled, readyState: audioTrack.readyState });
+      // iOS may release the wake lock during a system audio interruption;
+      // try to re-acquire when the mic is restored.
+      void requestWakeLock();
     };
   }
   browserLog('microphone capture enabled');
@@ -466,5 +486,9 @@ form.addEventListener('submit', async (event) => {
   };
   reconnectAttempts = 0;
   reconnectEnabled = true;
+  // Acquire the Screen Wake Lock while we still have the user gesture from
+  // the Connect button press. Safari on iOS requires transient activation
+  // for navigator.wakeLock.request('screen').
+  void acquireWakeLock();
   connectSignalling();
 });
