@@ -1,7 +1,7 @@
 require "set"
 
 @[Link("datachannel")]
-@[Link(ldflags: "#{__DIR__}/receiver_bridge.c")]
+@[Link(ldflags: "#{__DIR__}/receiver_bridge.cpp -lstdc++")]
 lib LibDataChannel
   alias Handle = Int32
 
