@@ -28,9 +28,6 @@ module Wumble
       peer = nil.as(Peer?)
       mumble = nil.as(MumbleConnection?)
       active_channel = nil.as(UInt32?)
-      mute_log_mutex = Mutex.new
-      mute_log = nil.as(File?)
-      mute_log_path = nil.as(String?)
       socket.on_message do |message|
         begin
           data = JSON.parse(message)
@@ -41,22 +38,6 @@ module Wumble
             event = data["event"]?.try(&.as_s) || "unknown client event"
             details = data["details"]?.try(&.to_json) || "{}"
             STDERR.puts "WebRTC client: #{event} #{details}"
-            mute_log_mutex.synchronize do
-              if event == "microphone muted by system"
-                unless mute_log
-                  mute_log_path = "mute-#{Time.utc.to_unix_ms}.opuslog"
-                  mute_log = File.open(mute_log_path.not_nil!, "w")
-                  STDERR.puts "WebRTC client: started mute packet log at #{mute_log_path}"
-                end
-              elsif event == "microphone unmuted by system"
-                if log = mute_log
-                  log.close
-                  STDERR.puts "WebRTC client: stopped mute packet log (#{mute_log_path})"
-                  mute_log = nil
-                  mute_log_path = nil
-                end
-              end
-            end
           when "ping"
             socket.send({type: "pong"}.to_json)
           when "connect"
@@ -69,18 +50,7 @@ module Wumble
               type = reconnect && !reason.starts_with?("Mumble rejected authentication") ? "mumble_disconnected" : "error"
               socket.send({type: type, message: reason}.to_json)
             end
-            peer.not_nil!.on_opus do |opus, frame_number|
-              if mute_log_mutex.synchronize { mute_log.nil? }
-                mumble.not_nil!.send_opus(opus, frame_number)
-              end
-              mute_log_mutex.synchronize do
-                if log = mute_log
-                  log.print(opus.hexstring)
-                  log.puts
-                  log.flush
-                end
-              end
-            end
+            peer.not_nil!.on_opus { |opus, frame_number| mumble.not_nil!.send_opus(opus, frame_number) }
             mumble.not_nil!.on_state do
               connection = mumble.not_nil!
               channel = connection.current_channel
@@ -88,18 +58,7 @@ module Wumble
               if active_channel && channel && active_channel != channel
                 peer.try &.close
                 peer = Peer.new
-                peer.not_nil!.on_opus do |opus, frame_number|
-                  if mute_log_mutex.synchronize { mute_log.nil? }
-                    mumble.not_nil!.send_opus(opus, frame_number)
-                  end
-                  mute_log_mutex.synchronize do
-                    if log = mute_log
-                      log.print(opus.hexstring)
-                      log.puts
-                      log.flush
-                    end
-                  end
-                end
+                peer.not_nil!.on_opus { |opus, frame_number| mumble.not_nil!.send_opus(opus, frame_number) }
                 connection.channel_users.each_key { |speaker| peer.not_nil!.prepare_speaker(speaker) }
                 socket.send({type: "restart_webrtc", speakers: connection.channel_users.size}.to_json)
               elsif prepare_channel_speakers(peer.not_nil!, connection)
@@ -186,10 +145,6 @@ module Wumble
       end
       socket.on_close do |code, reason|
         STDERR.puts "WebRTC signalling: WebSocket closed (#{code}: #{reason.inspect}); closing Mumble connection"
-        mute_log_mutex.synchronize do
-          mute_log.try &.close
-          mute_log = nil
-        end
         mumble.try &.close
         peer.try &.close
       end
