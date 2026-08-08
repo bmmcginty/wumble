@@ -294,6 +294,10 @@ module Wumble
       # A track message is normally an RTP packet. Keep the raw-payload path
       # for libdatachannel versions configured with an Opus depacketizer.
       return {packet, nil} unless packet.size >= 12 && (packet[0] >> 6) == 2
+      # RTCP packets share the RTP v=2 prefix but use PT values 192-223
+      # (RFC 3550). The browser sends periodic RTCP Sender Reports even
+      # while muted; drop them here so they never reach the Mumble path.
+      return nil if packet[1] >= 192
       timestamp = IO::ByteFormat::BigEndian.decode(UInt32, packet[4, 4])
       offset = 12 + (packet[0] & 0x0f) * 4
       return nil if offset > packet.size

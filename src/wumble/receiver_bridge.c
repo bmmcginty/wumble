@@ -5,8 +5,8 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
-#include <time.h>
 #include <stdlib.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -27,7 +27,13 @@ typedef struct {
 /*
  * Timestamped logger for libdatachannel so its internal messages can be
  * correlated with the receiver_bridge diagnostics below.
+ * Only active when WUMBLE_DEBUG=1 is set in the environment.
  */
+static bool debug_enabled(void) {
+    const char *env = getenv("WUMBLE_DEBUG");
+    return env && env[0] == '1' && env[1] == '\0';
+}
+
 static void log_callback(rtcLogLevel level, const char *message) {
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
@@ -47,7 +53,10 @@ static void log_callback(rtcLogLevel level, const char *message) {
 }
 
 void wumble_init_logger(void) {
-    rtcInitLogger(RTC_LOG_VERBOSE, log_callback);
+    if (debug_enabled())
+        rtcInitLogger(RTC_LOG_VERBOSE, log_callback);
+    else
+        rtcInitLogger(RTC_LOG_WARNING, NULL);
 }
 
 static void on_message(int track, const char *message, int size, void *ptr) {
@@ -58,8 +67,8 @@ static void on_message(int track, const char *message, int size, void *ptr) {
     if (!receiver || size <= 0 || size > 4090) return;
     atomic_fetch_add(&receiver->received, 1);
     /* Diagnostic: log first 8 bytes with a timestamp so we can correlate
-     * with the libdatachannel debug stream above. */
-    {
+     * with the libdatachannel debug stream above. Only when debugging. */
+    if (debug_enabled()) {
         struct timespec now;
         clock_gettime(CLOCK_REALTIME, &now);
         int64_t ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
@@ -92,24 +101,25 @@ static void on_track(int pc, int track, void *ptr) {
     rtcSetUserPointer(track, receiver);
     rtcSetMessageCallback(track, on_message);
 
-    /* Log the track's media description so we know what codecs and payload
-     * types libdatachannel has negotiated for it. */
-    char desc[4096] = "";
-    char mid[64] = "";
-    rtcDirection dir = RTC_DIRECTION_UNKNOWN;
-    rtcGetTrackDescription(track, desc, sizeof(desc));
-    rtcGetTrackMid(track, mid, sizeof(mid));
-    rtcGetTrackDirection(track, &dir);
+    /* Log the track's media description. Only when debugging. */
+    if (debug_enabled()) {
+        char desc[4096] = "";
+        char mid[64] = "";
+        rtcDirection dir = RTC_DIRECTION_UNKNOWN;
+        rtcGetTrackDescription(track, desc, sizeof(desc));
+        rtcGetTrackMid(track, mid, sizeof(mid));
+        rtcGetTrackDirection(track, &dir);
 
-    int pt_buf[32];
-    int pt_count = rtcGetTrackPayloadTypesForCodec(track, "opus", pt_buf, 32);
-    fprintf(stderr, "receiver_bridge: track=%d mid=\"%s\" dir=%d payload_types_opus_count=%d desc=\"%s\"\n",
-            track, mid, (int)dir, pt_count >= 0 ? pt_count : -1, desc);
-    if (pt_count > 0) {
-        fprintf(stderr, "receiver_bridge: track=%d opus_payload_types: ", track);
-        for (int i = 0; i < pt_count; i++)
-            fprintf(stderr, "%d ", pt_buf[i]);
-        fprintf(stderr, "\n");
+        int pt_buf[32];
+        int pt_count = rtcGetTrackPayloadTypesForCodec(track, "opus", pt_buf, 32);
+        fprintf(stderr, "receiver_bridge: track=%d mid=\"%s\" dir=%d payload_types_opus_count=%d desc=\"%s\"\n",
+                track, mid, (int)dir, pt_count >= 0 ? pt_count : -1, desc);
+        if (pt_count > 0) {
+            fprintf(stderr, "receiver_bridge: track=%d opus_payload_types: ", track);
+            for (int i = 0; i < pt_count; i++)
+                fprintf(stderr, "%d ", pt_buf[i]);
+            fprintf(stderr, "\n");
+        }
     }
 }
 
