@@ -344,10 +344,18 @@ module Wumble
       buffer = Bytes.new(65_535)
       until @closed
         size, _source = udp.receive(buffer)
-        plaintext = @crypt.try &.decrypt(buffer[0, size])
-        next unless plaintext
-        native_udp_received
-        receive_native_udp(plaintext)
+        # Decode and forwarding failures are per-packet. Letting one escape the
+        # loop would end this fiber and silence every speaker at once, so only
+        # a socket error (raised by receive above) may break out.
+        begin
+          plaintext = @crypt.try &.decrypt(buffer[0, size])
+          next unless plaintext
+          native_udp_received
+          receive_native_udp(plaintext)
+        rescue ex
+          STDERR.puts "Mumble UDP voice packet dropped: #{ex.message || ex.class.name}" unless @closed
+          STDERR.puts ex.backtrace.join('\n') if ENV["WUMBLE_DEBUG"]? == "1"
+        end
       end
     rescue ex
       STDERR.puts "Mumble UDP receive failed: #{ex.message || ex.class.name}" unless @closed

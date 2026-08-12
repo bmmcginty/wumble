@@ -46,10 +46,69 @@ lib LibDataChannel
 end
 
 module Wumble
+  # Which Mumble session owns which offered audio m= section.
+  #
+  # The gateway is always the WebRTC answerer, so it can never add an m= section
+  # on its own: a speaker can only be bridged once the browser has offered a
+  # section for it. This class owns that handshake's bookkeeping and is kept
+  # free of libdatachannel handles so it can be exercised without opening a peer
+  # connection (see spec/speaker_tracks_spec.cr).
+  class SpeakerTracks
+    getter speakers = Set(UInt32).new
+    # session -> mid of the audio section carrying that speaker
+    getter mids = Hash(UInt32, String).new
+    # mid -> Opus payload type, reparsed from every offer
+    getter payload_types = Hash(String, UInt8).new
+    getter? offered = false
+    getter? renegotiation_pending = false
+
+    # Installs the payload types of a newly accepted offer and assigns any
+    # sections it made available. Returns true when known speakers still need
+    # another offered section.
+    def accept_offer(payload_types : Hash(String, UInt8), &assign : UInt32, String -> Bool) : Bool
+      @payload_types = payload_types
+      @offered = true
+      assign_speakers(&assign)
+      @renegotiation_pending = @speakers.any? { |session| !@mids.has_key?(session) }
+    end
+
+    # Remembers a Mumble session until an offered section is available for it.
+    # Returns true when the browser must offer another audio section before this
+    # speaker can be bridged; the caller MUST act on that by asking the browser
+    # to renegotiate. A dropped `true` latches @renegotiation_pending with no
+    # offer ever arriving to clear it, which starves every later speaker of a
+    # track for the life of the peer connection.
+    def add(session : UInt32, &assign : UInt32, String -> Bool) : Bool
+      @speakers << session
+      assign_speakers(&assign) if @offered
+      return false if !@offered || @mids.has_key?(session) || @renegotiation_pending
+      @renegotiation_pending = true
+      true
+    end
+
+    private def assign_speakers(&assign : UInt32, String -> Bool)
+      @speakers.each do |session|
+        next if @mids.has_key?(session)
+        mid = available_mid
+        break unless mid
+        # Record the mid only once the track really exists, so a failed
+        # rtcAddTrack leaves the section free for the next attempt.
+        @mids[session] = mid if assign.call(session, mid)
+      end
+    end
+
+    # The browser offers its microphone on mid 0 and libdatachannel only answers
+    # sections it can pair with a local track, so mid 0 must always be claimed.
+    private def available_mid : String?
+      return "0" if @payload_types.has_key?("0") && !@mids.values.includes?("0")
+      @payload_types.keys.find { |candidate| !@mids.values.includes?(candidate) }
+    end
+  end
+
   class Peer
     getter pc : LibDataChannel::Handle
     @tracks = Hash(UInt32, LibDataChannel::Handle).new
-    @speakers = Set(UInt32).new
+    @speaker_tracks = SpeakerTracks.new
     @dropped_packets = Hash(UInt32, UInt64).new(0_u64)
     @sent_packets = Hash(UInt32, UInt64).new(0_u64)
     # These counters are updated in the Mumble UDP receive fiber but emitted
@@ -61,11 +120,7 @@ module Wumble
     @voice_dropped_unassigned = Hash(UInt32, UInt64).new(0_u64)
     @voice_dropped_unopened = Hash(UInt32, UInt64).new(0_u64)
     @sent_bytes = Hash(UInt32, UInt64).new(0_u64)
-    @opus_payload_types = Hash(String, UInt8).new
     @mid_extension_ids = Hash(String, UInt8).new
-    @track_mids = Hash(UInt32, String).new
-
-    getter speaker_mids = Hash(UInt32, String).new
     @sequence = Hash(UInt32, UInt16).new(0_u16)
     @timestamp = Hash(UInt32, UInt32).new(0_u32)
     @first_packet = Hash(UInt32, Bool).new(true)
@@ -74,8 +129,6 @@ module Wumble
     @next_mumble_frame = Hash(UInt32, UInt32).new
     @mumble_packet_frames = Hash(UInt32, UInt32).new
     @last_debug_at = Time.instant
-    @remote_description_set = false
-    @renegotiation_pending = false
 
     def initialize
       # Configure libdatachannel debug logging with timestamps so its
@@ -107,33 +160,43 @@ module Wumble
       @on_opus = block
     end
 
+    # Invoked when the browser must offer another audio section before a known
+    # speaker can be bridged. Voice packets can reveal a speaker before its
+    # Mumble UserState arrives, so this fires from the UDP voice fiber too.
+    def on_renegotiation_needed(&block : ->)
+      @on_renegotiation_needed = block
+    end
+
+    def speaker_mids : Hash(UInt32, String)
+      @speaker_tracks.mids
+    end
+
     # Returns true when additional known speakers still need another offered
     # audio section.
     def accept_offer(sdp : String) : Bool
-      @opus_payload_types = opus_payload_types(sdp)
+      payload_types = opus_payload_types(sdp)
       @mid_extension_ids = mid_extension_ids(sdp)
       result = LibDataChannel.rtc_set_remote_description(@pc, sdp.to_unsafe, "offer".to_unsafe)
       raise "rtcSetRemoteDescription failed (#{result})" if result < 0
-      @remote_description_set = true
-      assign_speaker_tracks
-      @renegotiation_pending = @speakers.any? { |session| !@tracks.has_key?(session) }
+      @speaker_tracks.accept_offer(payload_types) { |session, mid| add_speaker_track(session, mid) }
     end
 
     def add_candidate(candidate : String, mid : String)
       check LibDataChannel.rtc_add_remote_candidate(@pc, candidate.to_unsafe, mid.to_unsafe)
     end
 
-    # Remember known Mumble sessions until the browser offer has installed the
-    # remote media description. libdatachannel rejects rtcAddTrack before that
-    # point when it is acting as the answerer.
-    # Returns true when the browser must offer another audio section before
-    # this speaker can be assigned a WebRTC track.
-    def prepare_speaker(session : UInt32) : Bool
-      @speakers << session
-      assign_speaker_tracks if @remote_description_set
-      return false if !@remote_description_set || @tracks.has_key?(session) || @renegotiation_pending
-      @renegotiation_pending = true
-      true
+    # Remember a Mumble session and bridge it as soon as the browser has offered
+    # an audio section for it, asking for another section when it has not.
+    # libdatachannel rejects rtcAddTrack until the offer has installed the
+    # remote media description, so sessions seen before then are only recorded.
+    #
+    # This is the only entry point on purpose: SpeakerTracks#add coalesces its
+    # request into a single pending renegotiation, so a caller that ignored the
+    # request would latch that flag with no offer ever arriving to clear it,
+    # starving every later speaker of a track for the life of this Peer.
+    def request_speaker(session : UInt32) : Nil
+      needed = @speaker_tracks.add(session) { |speaker, mid| add_speaker_track(speaker, mid) }
+      @on_renegotiation_needed.try &.call if needed
     end
 
     # Do not use libdatachannel's callbacks here. They run on its native C++
@@ -156,11 +219,15 @@ module Wumble
     # TOC: a mismatched inferred duration makes the browser conceal samples and
     # steadily expand its jitter buffer.
     def send_opus(session : UInt32, opus : Bytes, frame_number : UInt32? = nil)
-      prepare_speaker(session)
+      request_speaker(session)
       if track = @tracks[session]?
         if LibDataChannel.rtc_is_open(track)
-          forward_opus(session, track, opus, frame_number)
-          record_mumble_voice(session, opus.size, :forwarded)
+          if forward_opus(session, track, opus, frame_number)
+            record_mumble_voice(session, opus.size, :forwarded)
+          else
+            @dropped_packets[session] += 1
+            record_mumble_voice(session, opus.size, :unassigned)
+          end
         else
           @dropped_packets[session] += 1
           record_mumble_voice(session, opus.size, :unopened)
@@ -313,10 +380,15 @@ module Wumble
 
     private def forward_opus(session : UInt32, track : LibDataChannel::Handle, opus : Bytes, frame_number : UInt32?)
       duration = opus_duration_samples(opus)
+      # A renegotiated offer can renumber or drop a mid that already has a
+      # track. Never raise here: this runs on the Mumble UDP voice fiber, where
+      # an exception would take down every speaker at once.
+      mid = @speaker_tracks.mids[session]?
+      return false unless mid
+      payload_type = @speaker_tracks.payload_types[mid]?
+      return false unless payload_type
       preserve_mumble_sequence_gap(session, frame_number, duration)
       @timestamp[session] = frame_number.not_nil! &* 480_u32 if frame_number
-      mid = @track_mids[session]
-      payload_type = @opus_payload_types[mid]
       # BUNDLE requires the MID extension to associate an RTP SSRC with its
       # m= section. libdatachannel's C Opus packetizer omits it, so construct
       # the small RTP header here and send it directly to the track.
@@ -337,13 +409,15 @@ module Wumble
         payload_offset += extension_size
       end
       rtp[payload_offset, opus.size].copy_from(opus)
-      check LibDataChannel.rtc_send_message(track, rtp.to_unsafe, rtp.size)
+      result = LibDataChannel.rtc_send_message(track, rtp.to_unsafe, rtp.size)
+      return false if result < 0
       @sequence[session] &+= 1_u16
       @timestamp[session] &+= duration
       @first_packet[session] = false
       @sent_packets[session] += 1
       @sent_bytes[session] += opus.size.to_u64
       log_media_debug if debug?
+      true
     end
 
     # RTP timestamps identify the duration of a loss, while RTP sequence gaps
@@ -367,27 +441,20 @@ module Wumble
       @mumble_packet_frames[session] = packet_frames
     end
 
-    private def assign_speaker_tracks
-      @speakers.each do |session|
-        next if @tracks.has_key?(session)
-        mid = available_speaker_mid
-        break unless mid
-        add_speaker_track(session, mid)
-      end
-    end
-
-    private def available_speaker_mid : String?
-      return "0" if @opus_payload_types.has_key?("0") && !@track_mids.values.includes?("0")
-      @opus_payload_types.keys.find { |candidate| !@track_mids.values.includes?(candidate) }
-    end
-
-    private def add_speaker_track(session : UInt32, mid : String)
+    # Returns false when the section could not be claimed, leaving it free for
+    # the next speaker. This is reachable from the Mumble UDP voice fiber, so it
+    # reports failure rather than raising.
+    private def add_speaker_track(session : UInt32, mid : String) : Bool
       # A stable, per-speaker SSRC lets the browser expose each voice as an
       # independent MediaStreamTrack.
       # RTP payload types are scoped to the offer. Chrome generally offers
       # Opus as 111, while Firefox commonly uses 109; answering with a new
       # payload type makes Firefox discard otherwise valid SRTP packets.
-      payload_type = @opus_payload_types[mid]? || raise "offer has no Opus payload type for audio mid #{mid}"
+      payload_type = @speaker_tracks.payload_types[mid]?
+      unless payload_type
+        STDERR.puts "WebRTC: offer has no Opus payload type for audio mid #{mid}; skipping session=#{session}"
+        return false
+      end
       # The browser offers its microphone on m=0. Make that paired track
       # sendrecv so the answer authorizes browser-to-gateway RTP as well as
       # gateway-to-browser speaker audio; the remaining speaker tracks are
@@ -395,11 +462,13 @@ module Wumble
       direction = mid == "0" ? "sendrecv" : "sendonly"
       sdp = "m=audio 9 UDP/TLS/RTP/SAVPF #{payload_type}\r\na=mid:#{mid}\r\na=#{direction}\r\na=rtpmap:#{payload_type} opus/48000/2\r\na=fmtp:#{payload_type} minptime=10;useinbandfec=1\r\na=ssrc:#{session} cname:wumble-#{session}\r\n"
       track = LibDataChannel.rtc_add_track(@pc, sdp.to_unsafe)
-      raise "rtcAddTrack failed (#{track})" if track < 0
+      if track < 0
+        STDERR.puts "WebRTC: rtcAddTrack failed (#{track}) for session=#{session} mid=#{mid}"
+        return false
+      end
       STDERR.puts "WebRTC: added Opus track session=#{session} mid=#{mid} track=#{track} ssrc=#{session} payload_type=#{payload_type} mid_extension=#{@mid_extension_ids[mid]?}" if debug?
       @tracks[session] = track
-      @track_mids[session] = mid
-      @speaker_mids[session] = mid
+      true
     end
 
     private def mid_extension_ids(sdp : String) : Hash(String, UInt8)

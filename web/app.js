@@ -19,6 +19,8 @@ let connectionActive = false;
 let wakeLock;
 const speakerInfoByMid = new Map();
 const currentChannelSessions = new Set();
+const speakerAudio = new Set();
+let playbackResumeRunning = false;
 const connectionFragmentFields = [
   { parameter: 'host', input: form.elements.namedItem('server') },
   { parameter: 'port', input: form.elements.namedItem('port') },
@@ -109,6 +111,50 @@ function startMediaStats() {
 }
 
 function setStatus(text) { status.textContent = text; }
+
+// iOS Safari suspends the page's audio session during a system mic
+// interruption (Siri, an incoming call, backgrounding) and pauses every media
+// element without ever resuming it. Autoplay here is granted by the active
+// getUserMedia capture, which is exactly what the interruption takes away, so
+// an element created or paused during one stays silent while its RTP keeps
+// arriving. Nothing else in this page calls play(), so this is the only path
+// back to audible.
+async function resumeSpeakerPlayback(reason) {
+  if (playbackResumeRunning) return;
+  playbackResumeRunning = true;
+  try {
+    // The audio session is restored asynchronously after the interruption
+    // ends, so a single attempt often lands too early.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const paused = [...speakerAudio].filter((audio) => audio.paused);
+      if (!paused.length) return;
+      browserLog('resuming speaker playback', { reason, attempt, paused: paused.length });
+      for (const audio of paused) {
+        try {
+          await audio.play();
+        } catch (error) {
+          browserLog('speaker playback resume failed', {
+            reason,
+            attempt,
+            session: audio.dataset.session || null,
+            message: String(error),
+            name: error.name,
+          });
+        }
+      }
+      if (![...speakerAudio].some((audio) => audio.paused)) return;
+      await new Promise((resolve) => window.setTimeout(resolve, 250));
+    }
+  } finally {
+    playbackResumeRunning = false;
+  }
+}
+
+function removeSpeakerArticle(article) {
+  for (const audio of article.querySelectorAll('audio')) speakerAudio.delete(audio);
+  article.remove();
+}
+
 async function acquireWakeLock() {
   if (!navigator.wakeLock?.request || wakeLock) return;
   browserLog('screen wake lock requesting', { visibilityState: document.visibilityState, connectionActive, hasGesture: navigator.userActivation?.isActive });
@@ -144,9 +190,15 @@ async function releaseWakeLock() {
 }
 document.addEventListener('visibilitychange', () => {
   browserLog('visibility change', { visibilityState: document.visibilityState });
-  if (document.visibilityState === 'visible') void requestWakeLock();
+  if (document.visibilityState === 'visible') {
+    void requestWakeLock();
+    void resumeSpeakerPlayback('visibility change');
+  }
 });
-window.addEventListener('focus', () => { void requestWakeLock(); });
+window.addEventListener('focus', () => {
+  void requestWakeLock();
+  void resumeSpeakerPlayback('window focus');
+});
 window.addEventListener('pagehide', () => { void releaseWakeLock(); });
 function setConnectionActive(active) {
   connectionActive = active;
@@ -167,8 +219,16 @@ function updateChannels({ current_channel: currentChannel, channels, users }) {
   channelSelect.disabled = !connectionActive || !selected;
   currentChannelSessions.clear();
   for (const user of users || []) currentChannelSessions.add(String(user.session));
+  const trackedSessions = new Set([...speakerInfoByMid.values()].map((speaker) => String(speaker.session)));
   for (const article of speakers.querySelectorAll('article')) {
-    if (!currentChannelSessions.has(article.dataset.session)) article.remove();
+    // Never drop an element the gateway still has a track for. The roster is
+    // empty in every channel_state sent before ServerSync (current_channel is
+    // null until then), and an article whose mid was missing from the answer
+    // has no session at all — removing either one silences a live stream with
+    // no way to recreate it, since ontrack will not fire again.
+    const session = article.dataset.session;
+    if (!session || currentChannelSessions.has(session) || trackedSessions.has(session)) continue;
+    removeSpeakerArticle(article);
   }
 }
 channelSelect.addEventListener('change', () => {
@@ -216,8 +276,10 @@ async function captureMicrophone(restart = false) {
       audioTrack.enabled = true;
       browserLog('microphone unmuted by system', { muted: audioTrack.muted, enabled: audioTrack.enabled, readyState: audioTrack.readyState });
       // iOS may release the wake lock during a system audio interruption;
-      // try to re-acquire when the mic is restored.
+      // try to re-acquire when the mic is restored. The same interruption
+      // paused every speaker element, so restart those too.
       void requestWakeLock();
+      void resumeSpeakerPlayback('microphone unmuted');
     };
   }
   browserLog('microphone capture enabled');
@@ -254,6 +316,10 @@ async function attemptRenegotiation() {
 async function makeOffer(speakerCount = 1) {
   renegotiationRequested = false;
   renegotiationInProgress = false;
+  // Every track belongs to the PeerConnection being replaced, so drop the old
+  // elements rather than leaving dead ones for updateChannels to reap.
+  speakers.replaceChildren();
+  speakerAudio.clear();
   const currentPeer = new RTCPeerConnection({ iceServers: [] });
   peer = currentPeer;
   // Use the first speaker m= section in both directions. libdatachannel only
@@ -331,15 +397,26 @@ async function makeOffer(speakerCount = 1) {
     });
 //    volumeLabel.append(volume);
     audio.onplaying = () => browserLog('speaker audio playing', { track: track.id, session: speaker?.session ?? null, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
-    audio.onwaiting = () => browserLog('speaker audio waiting', { track: track.id, session: speaker?.session ?? null, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
-    audio.onstalled = () => browserLog('speaker audio stalled', { track: track.id, session: speaker?.session ?? null });
+    audio.onwaiting = () => {
+      browserLog('speaker audio waiting', { track: track.id, session: speaker?.session ?? null, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
+      void resumeSpeakerPlayback('speaker audio waiting');
+    };
+    audio.onstalled = () => {
+      browserLog('speaker audio stalled', { track: track.id, session: speaker?.session ?? null });
+      void resumeSpeakerPlayback('speaker audio stalled');
+    };
     audio.onerror = () => browserLog('speaker audio error', { track: track.id, session: speaker?.session ?? null, error: audio.error?.message });
     track.onmute = () => browserLog('remote track muted', { id: track.id, session: speaker?.session ?? null });
     track.onunmute = () => browserLog('remote track unmuted', { id: track.id, session: speaker?.session ?? null });
     container.dataset.session = speaker?.session ?? '';
     container.append(heading, volume, audio);
     speakers.append(container);
-    track.onended = () => { browserLog('remote track ended', { id: track.id, session: speaker?.session ?? null }); container.remove(); };
+    speakerAudio.add(audio);
+    // A track that arrives while the audio session is interrupted cannot
+    // autoplay, so ask for playback explicitly rather than trusting the
+    // autoplay attribute.
+    void resumeSpeakerPlayback('remote track added');
+    track.onended = () => { browserLog('remote track ended', { id: track.id, session: speaker?.session ?? null }); removeSpeakerArticle(container); };
   };
   await sendOffer();
 }
@@ -392,7 +469,6 @@ function connectSignalling() {
       peer?.close();
       peer = undefined;
       speakerInfoByMid.clear();
-      speakers.replaceChildren();
       await makeOffer(message.speakers);
     } else if (message.type === 'answer') {
       speakerInfoByMid.clear();

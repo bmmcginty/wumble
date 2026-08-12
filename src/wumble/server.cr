@@ -28,6 +28,35 @@ module Wumble
       peer = nil.as(Peer?)
       mumble = nil.as(MumbleConnection?)
       active_channel = nil.as(UInt32?)
+      # Signalling is now emitted from the Mumble TCP fiber (on_state), the
+      # Mumble UDP voice fiber (a speaker heard before its UserState) and the
+      # answer fiber. Serialize the frames so they cannot interleave, and
+      # swallow send errors: an exception raised inside a Mumble callback
+      # unwinds that connection's read loop and is reported as a Mumble
+      # disconnect.
+      send_lock = Mutex.new
+      send_signal = ->(payload : String) do
+        send_lock.synchronize do
+          socket.send(payload)
+        rescue ex
+          STDERR.puts "WebRTC signalling: send failed: #{ex.message || ex.class.name}"
+        end
+      end
+      # Every Peer, including the one rebuilt on a channel switch, needs the
+      # same wiring. on_renegotiation_needed is what breaks the deadlock: a
+      # speaker first heard on the voice fiber must still get the browser to
+      # offer an audio section for it.
+      wire_peer = ->(new_peer : Peer) do
+        new_peer.on_opus { |opus, frame_number| mumble.not_nil!.send_opus(opus, frame_number) }
+        new_peer.on_renegotiation_needed do
+          STDERR.puts "WebRTC signalling: requesting renegotiation for new speaker"
+          # This can fire from the Mumble UDP voice fiber. Hand the send to a
+          # new fiber so a slow or blocked WebSocket cannot stall voice
+          # forwarding for every speaker; the request is idempotent, so its
+          # ordering against other frames does not matter.
+          spawn { send_signal.call({type: "renegotiate"}.to_json) }
+        end
+      end
       socket.on_message do |message|
         begin
           data = JSON.parse(message)
@@ -39,7 +68,7 @@ module Wumble
             details = data["details"]?.try(&.to_json) || "{}"
             STDERR.puts "WebRTC client: #{event} #{details}"
           when "ping"
-            socket.send({type: "pong"}.to_json)
+            send_signal.call({type: "pong"}.to_json)
           when "connect"
             raise "already connected" if peer
             request = ConnectRequest.from_json(data["options"].to_json)
@@ -48,28 +77,27 @@ module Wumble
             mumble = MumbleConnection.new(request.server, request.port, request.username, request.password)
             mumble.not_nil!.on_disconnect do |reason, reconnect|
               type = reconnect && !reason.starts_with?("Mumble rejected authentication") ? "mumble_disconnected" : "error"
-              socket.send({type: type, message: reason}.to_json)
+              send_signal.call({type: type, message: reason}.to_json)
             end
-            peer.not_nil!.on_opus { |opus, frame_number| mumble.not_nil!.send_opus(opus, frame_number) }
+            wire_peer.call(peer.not_nil!)
             mumble.not_nil!.on_state do
               connection = mumble.not_nil!
               channel = connection.current_channel
-              socket.send(channel_state(connection).to_json)
-              if active_channel && channel && active_channel != channel
+              send_signal.call(channel_state(connection).to_json)
+              switched = !!(active_channel && channel && active_channel != channel)
+              if switched
                 peer.try &.close
                 peer = Peer.new
-                peer.not_nil!.on_opus { |opus, frame_number| mumble.not_nil!.send_opus(opus, frame_number) }
-                connection.channel_users.each_key { |speaker| peer.not_nil!.prepare_speaker(speaker) }
-                socket.send({type: "restart_webrtc", speakers: connection.channel_users.size}.to_json)
-              elsif prepare_channel_speakers(peer.not_nil!, connection)
-                # A UserState update can contain only a channel change and no
-                # name. Reconcile the complete channel membership here rather
-                # than relying on the name-bearing on_user callback, so an
-                # already-connected browser is offered a track for every
-                # newcomer.
-                STDERR.puts "WebRTC signalling: requesting renegotiation for new channel speaker"
-                socket.send({type: "renegotiate"}.to_json)
+                wire_peer.call(peer.not_nil!)
               end
+              # A UserState update can contain only a channel change and no
+              # name. Reconcile the complete channel membership here rather
+              # than relying on the name-bearing on_user callback, so an
+              # already-connected browser is offered a track for every
+              # newcomer. On a fresh Peer these only populate the roster: no
+              # offer has been accepted yet, so restart_webrtc drives that.
+              connection.channel_users.each_key { |speaker| peer.not_nil!.request_speaker(speaker) }
+              send_signal.call({type: "restart_webrtc", speakers: connection.channel_users.size}.to_json) if switched
               active_channel = channel if channel
             end
             mumble.not_nil!.on_voice { |speaker, opus, frame_number| peer.not_nil!.send_opus(speaker, opus, frame_number) }
@@ -79,20 +107,20 @@ module Wumble
             # head-of-line blocking causes the latency this gateway avoids.
             mumble.not_nil!.on_ready do
               connection = mumble.not_nil!
-              connection.channel_users.each_key { |speaker| peer.not_nil!.prepare_speaker(speaker) }
+              connection.channel_users.each_key { |speaker| peer.not_nil!.request_speaker(speaker) }
               if connection.udp_available
-                socket.send({type: "connected", speakers: connection.channel_users.size}.to_json)
+                send_signal.call({type: "connected", speakers: connection.channel_users.size}.to_json)
               end
             end
             mumble.not_nil!.on_udp_available do
               connection = mumble.not_nil!
-              connection.channel_users.each_key { |speaker| peer.not_nil!.prepare_speaker(speaker) }
+              connection.channel_users.each_key { |speaker| peer.not_nil!.request_speaker(speaker) }
               if connection.synchronized
-                socket.send({type: "connected", speakers: connection.channel_users.size}.to_json)
+                send_signal.call({type: "connected", speakers: connection.channel_users.size}.to_json)
               end
             end
             mumble.not_nil!.on_udp_unavailable do
-              socket.send({type: "udp_unavailable", message: "Native UDP to the Mumble server is unavailable. Check UDP port #{request.port}."}.to_json)
+              send_signal.call({type: "udp_unavailable", message: "Native UDP to the Mumble server is unavailable. Check UDP port #{request.port}."}.to_json)
             end
             mumble.not_nil!.connect
           when "switch_channel"
@@ -123,13 +151,13 @@ module Wumble
                 speakers = current_peer.speaker_mids.map do |session, mid|
                   {session: session, mid: mid, name: mumble.not_nil!.users[session]? || "Session #{session}"}
                 end
-                socket.send({type: "answer", sdp: answer, description_type: "answer", speakers: speakers}.to_json)
-                socket.send({type: "renegotiate"}.to_json) if needs_renegotiation
+                send_signal.call({type: "answer", sdp: answer, description_type: "answer", speakers: speakers}.to_json)
+                send_signal.call({type: "renegotiate"}.to_json) if needs_renegotiation
                 STDERR.puts "WebRTC signalling: sent answer (#{answer.bytesize} bytes)"
               rescue ex
                 STDERR.puts "WebRTC answer error: #{ex.message || ex.class.name}"
                 STDERR.puts ex.backtrace.join('\n') if ENV["WUMBLE_DEBUG"]? == "1"
-                socket.send({type: "error", message: ex.message || "failed to create WebRTC answer"}.to_json)
+                send_signal.call({type: "error", message: ex.message || "failed to create WebRTC answer"}.to_json)
               end
             end
           when "candidate"
@@ -140,7 +168,7 @@ module Wumble
         rescue ex
           STDERR.puts "WebRTC signalling error: #{ex.message || ex.class.name}"
           STDERR.puts ex.backtrace.join('\n') if ENV["WUMBLE_DEBUG"]? == "1"
-          socket.send({type: "error", message: ex.message || "connection failed"}.to_json)
+          send_signal.call({type: "error", message: ex.message || "connection failed"}.to_json)
         end
       end
       socket.on_close do |code, reason|
@@ -148,17 +176,6 @@ module Wumble
         mumble.try &.close
         peer.try &.close
       end
-    end
-
-    # Returns true only when Peer needs the browser to offer another audio
-    # section. prepare_speaker coalesces simultaneous joins while one
-    # renegotiation is already pending.
-    private def prepare_channel_speakers(peer : Peer, mumble : MumbleConnection) : Bool
-      needs_renegotiation = false
-      mumble.channel_users.each_key do |speaker|
-        needs_renegotiation = peer.prepare_speaker(speaker) || needs_renegotiation
-      end
-      needs_renegotiation
     end
 
     private def channel_state(mumble : MumbleConnection)
