@@ -148,12 +148,20 @@ module Wumble
                 end
                 answer ||= raise "libdatachannel did not produce an answer"
                 STDERR.puts "WebRTC signalling: local ICE candidate was not ready after 250 ms; sending available answer" unless answer.includes?("a=candidate:")
-                speakers = current_peer.speaker_mids.map do |session, mid|
-                  {session: session, mid: mid, name: mumble.not_nil!.users[session]? || "Session #{session}"}
+                # A channel switch replaces peer while this fiber may still be
+                # waiting for ICE. Never send the old peer's answer after a
+                # restart_webrtc: the browser would apply it to its replacement
+                # PeerConnection and reject or corrupt the negotiation.
+                if peer == current_peer
+                  speakers = current_peer.speaker_mids.map do |session, mid|
+                    {session: session, mid: mid, name: mumble.not_nil!.users[session]? || "Session #{session}"}
+                  end
+                  send_signal.call({type: "answer", sdp: answer, description_type: "answer", speakers: speakers}.to_json)
+                  send_signal.call({type: "renegotiate"}.to_json) if needs_renegotiation
+                  STDERR.puts "WebRTC signalling: sent answer (#{answer.bytesize} bytes)"
+                else
+                  STDERR.puts "WebRTC signalling: discarding answer from replaced peer"
                 end
-                send_signal.call({type: "answer", sdp: answer, description_type: "answer", speakers: speakers}.to_json)
-                send_signal.call({type: "renegotiate"}.to_json) if needs_renegotiation
-                STDERR.puts "WebRTC signalling: sent answer (#{answer.bytesize} bytes)"
               rescue ex
                 STDERR.puts "WebRTC answer error: #{ex.message || ex.class.name}"
                 STDERR.puts ex.backtrace.join('\n') if ENV["WUMBLE_DEBUG"]? == "1"
