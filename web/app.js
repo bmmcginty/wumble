@@ -155,6 +155,12 @@ function removeSpeakerArticle(article) {
   article.remove();
 }
 
+function clearSpeakerArticles() {
+  speakers.replaceChildren();
+  speakerAudio.clear();
+  speakerInfoByMid.clear();
+}
+
 async function acquireWakeLock() {
   if (!navigator.wakeLock?.request || wakeLock) return;
   browserLog('screen wake lock requesting', { visibilityState: document.visibilityState, connectionActive, hasGesture: navigator.userActivation?.isActive });
@@ -218,17 +224,31 @@ function updateChannels({ current_channel: currentChannel, channels, users }) {
   channelControl.hidden = channelSelect.options.length === 0;
   channelSelect.disabled = !connectionActive || !selected;
   currentChannelSessions.clear();
-  for (const user of users || []) currentChannelSessions.add(String(user.session));
-  const trackedSessions = new Set([...speakerInfoByMid.values()].map((speaker) => String(speaker.session)));
+  const namesBySession = new Map();
+  for (const user of users || []) {
+    const session = String(user.session);
+    currentChannelSessions.add(session);
+    namesBySession.set(session, user.name);
+  }
+  // Before ServerSync current_channel is null and the roster is necessarily
+  // empty. Do not mistake that initial partial state for every user leaving.
+  if (currentChannel == null) return;
   for (const article of speakers.querySelectorAll('article')) {
-    // Never drop an element the gateway still has a track for. The roster is
-    // empty in every channel_state sent before ServerSync (current_channel is
-    // null until then), and an article whose mid was missing from the answer
-    // has no session at all — removing either one silences a live stream with
-    // no way to recreate it, since ontrack will not fire again.
     const session = article.dataset.session;
-    if (!session || currentChannelSessions.has(session) || trackedSessions.has(session)) continue;
-    removeSpeakerArticle(article);
+    // An answer without a mapping cannot be reconciled to the Mumble roster;
+    // retain it until its track ends or this PeerConnection is cleared.
+    if (!session) continue;
+    if (!currentChannelSessions.has(session)) {
+      browserLog('removing departed speaker', { session, mid: article.dataset.mid || null });
+      removeSpeakerArticle(article);
+      continue;
+    }
+    const name = namesBySession.get(session);
+    if (name) {
+      const label = `${name} (session ${session})`;
+      article.querySelector('h2').textContent = label;
+      article.querySelector('audio').title = label;
+    }
   }
 }
 channelSelect.addEventListener('change', () => {
@@ -318,8 +338,7 @@ async function makeOffer(speakerCount = 1) {
   renegotiationInProgress = false;
   // Every track belongs to the PeerConnection being replaced, so drop the old
   // elements rather than leaving dead ones for updateChannels to reap.
-  speakers.replaceChildren();
-  speakerAudio.clear();
+  clearSpeakerArticles();
   const currentPeer = new RTCPeerConnection({ iceServers: [] });
   peer = currentPeer;
   // Use the first speaker m= section in both directions. libdatachannel only
@@ -371,6 +390,11 @@ async function makeOffer(speakerCount = 1) {
     browserLog('received remote track', { id: track.id, kind: track.kind, streams: streams.length, mid: transceiver?.mid, speaker });
     // Do not combine tracks into one MediaStream. One received track means one
     // Mumble speaker and gets its own audio element and jitter buffer.
+    // A renegotiation should retain the same receiver, but Safari can emit a
+    // duplicate ontrack for an existing m= section. Keep one article per mid.
+    for (const article of speakers.querySelectorAll('article')) {
+      if (article.dataset.mid === (transceiver?.mid ?? '')) removeSpeakerArticle(article);
+    }
     const container = document.createElement('article');
     const heading = document.createElement('h2');
     heading.textContent = label;
@@ -409,6 +433,7 @@ async function makeOffer(speakerCount = 1) {
     track.onmute = () => browserLog('remote track muted', { id: track.id, session: speaker?.session ?? null });
     track.onunmute = () => browserLog('remote track unmuted', { id: track.id, session: speaker?.session ?? null });
     container.dataset.session = speaker?.session ?? '';
+    container.dataset.mid = transceiver?.mid ?? '';
     container.append(heading, volume, audio);
     speakers.append(container);
     speakerAudio.add(audio);
@@ -505,6 +530,8 @@ function connectSignalling() {
     window.clearInterval(statsTimer);
     peer?.close();
     peer = undefined;
+    clearSpeakerArticles();
+    currentChannelSessions.clear();
     console.info(`Wumble signalling WebSocket closed (${code}: ${reason || 'no reason'})`);
     setConnectionActive(false);
     channelSelect.disabled = true;
@@ -527,6 +554,8 @@ form.addEventListener('submit', async (event) => {
     activeSocket?.close();
     peer?.close();
     peer = undefined;
+    clearSpeakerArticles();
+    currentChannelSessions.clear();
     window.clearInterval(heartbeat);
     window.clearInterval(statsTimer);
     stopMicrophone();
