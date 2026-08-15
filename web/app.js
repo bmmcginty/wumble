@@ -19,8 +19,13 @@ let connectionActive = false;
 let wakeLock;
 const speakerInfoByMid = new Map();
 const currentChannelSessions = new Set();
-const speakerAudio = new Set();
+// Element -> the remote track it plays. The track is kept because reattaching
+// after an interruption has to build a new MediaStream around the same track.
+const speakerAudio = new Map();
 let playbackResumeRunning = false;
+let audioProbe;
+let audioRecoveryRunning = false;
+let audioRecoveryNeeded = false;
 const connectionFragmentFields = [
   { parameter: 'host', input: form.elements.namedItem('server') },
   { parameter: 'port', input: form.elements.namedItem('port') },
@@ -126,7 +131,7 @@ async function resumeSpeakerPlayback(reason) {
     // The audio session is restored asynchronously after the interruption
     // ends, so a single attempt often lands too early.
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const paused = [...speakerAudio].filter((audio) => audio.paused);
+      const paused = [...speakerAudio.keys()].filter((audio) => audio.paused);
       if (!paused.length) return;
       browserLog('resuming speaker playback', { reason, attempt, paused: paused.length });
       for (const audio of paused) {
@@ -142,12 +147,117 @@ async function resumeSpeakerPlayback(reason) {
           });
         }
       }
-      if (![...speakerAudio].some((audio) => audio.paused)) return;
+      if (![...speakerAudio.keys()].some((audio) => audio.paused)) return;
       await new Promise((resolve) => window.setTimeout(resolve, 250));
     }
   } finally {
     playbackResumeRunning = false;
   }
+}
+
+// Pausing and playing is only a repair for an element Safari itself stopped.
+// After a Siri interruption the elements come back reporting that they are
+// playing -- currentTime keeps advancing and inbound-rtp keeps reporting audio
+// energy -- while nothing reaches the speaker, and no element event fires.
+// Pointing each element at a fresh MediaStream over the same track is the only
+// way from script to make Safari build a new renderer for it.
+async function reattachSpeakerAudio(reason) {
+  if (!speakerAudio.size) return;
+  browserLog('reattaching speaker audio', { reason, speakers: speakerAudio.size });
+  for (const [audio, track] of speakerAudio) {
+    try {
+      audio.srcObject = null;
+      audio.srcObject = new MediaStream([track]);
+      await audio.play();
+    } catch (error) {
+      browserLog('speaker reattach failed', {
+        reason,
+        session: audio.dataset.session || null,
+        message: String(error),
+        name: error.name,
+      });
+    }
+  }
+}
+
+// Rebuild what the interruption tore down, in dependency order: the audio
+// session first, then the elements that render into it. Resuming the context
+// alone was tried and is not enough -- it returns to 'running' and the speakers
+// stay silent -- so the context state is a reliable detector of the
+// interruption, and the reattach is the repair.
+async function recoverAudio(reason) {
+  if (audioRecoveryRunning || !connectionActive) return;
+  audioRecoveryRunning = true;
+  try {
+    browserLog('audio recovery starting', {
+      reason,
+      visibility: document.visibilityState,
+      audioContext: audioProbe?.state ?? null,
+      speakers: speakerAudio.size,
+    });
+    await resumeAudioProbe(reason);
+    await reattachSpeakerAudio(reason);
+    await resumeSpeakerPlayback(reason);
+    browserLog('audio recovery finished', { reason, audioContext: audioProbe?.state ?? null });
+  } catch (error) {
+    browserError('audio recovery failed', { reason, message: String(error), name: error.name });
+  } finally {
+    audioRecoveryRunning = false;
+  }
+}
+
+// The interruption ends in several steps that arrive in any order: the page
+// becomes visible again, the capture unmutes, and the audio context leaves
+// 'interrupted'. Recovering needs all of them, so whichever lands last runs it.
+// The context guard is not just bookkeeping: resume() while iOS still holds
+// the session is the call that fails.
+function maybeRecoverAudio(reason) {
+  if (!audioRecoveryNeeded || !connectionActive) return;
+  if (document.visibilityState !== 'visible') return;
+  if (microphoneStream?.getAudioTracks()[0]?.muted) return;
+  if (audioProbe?.state === 'interrupted') return;
+  audioRecoveryNeeded = false;
+  void recoverAudio(reason);
+}
+
+// Safari parks every audio context of an interrupted page in the non-standard
+// 'interrupted' state and leaves it there, which is the one direct read the
+// page gets on its own audio session. Nothing is connected to this context:
+// routing speaker audio through Web Audio was tried and reverted, and doing it
+// again here would put the reverted path back on the hot audio route.
+function startAudioProbe() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (audioProbe || !AudioContextClass) return;
+  audioProbe = new AudioContextClass();
+  audioProbe.onstatechange = () => {
+    const state = audioProbe?.state ?? null;
+    browserLog('audio context state', { state });
+    // 'interrupted' is a first-hand report that iOS took the session away,
+    // which a system capture mute only implies. Arm on it as well so an
+    // interruption that never mutes the capture still gets recovered.
+    if (state === 'interrupted') audioRecoveryNeeded = true;
+    else maybeRecoverAudio('audio context state');
+  };
+  browserLog('audio context created', { state: audioProbe.state, sampleRate: audioProbe.sampleRate });
+}
+
+async function resumeAudioProbe(reason) {
+  if (!audioProbe || audioProbe.state === 'running') return;
+  browserLog('audio context resuming', { reason, state: audioProbe.state });
+  try {
+    await audioProbe.resume();
+    browserLog('audio context resumed', { reason, state: audioProbe.state });
+  } catch (error) {
+    browserLog('audio context resume failed', { reason, state: audioProbe.state, message: String(error), name: error.name });
+  }
+}
+
+function stopAudioProbe() {
+  if (!audioProbe) return;
+  const context = audioProbe;
+  audioProbe = undefined;
+  context.onstatechange = null;
+  void context.close().catch(() => {});
 }
 
 function removeSpeakerArticle(article) {
@@ -199,11 +309,13 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     void requestWakeLock();
     void resumeSpeakerPlayback('visibility change');
+    maybeRecoverAudio('visibility change');
   }
 });
 window.addEventListener('focus', () => {
   void requestWakeLock();
   void resumeSpeakerPlayback('window focus');
+  maybeRecoverAudio('window focus');
 });
 window.addEventListener('pagehide', () => { void releaseWakeLock(); });
 function setConnectionActive(active) {
@@ -290,6 +402,11 @@ async function captureMicrophone(restart = false) {
   if (audioTrack) {
     audioTrack.onmute = () => {
       audioTrack.enabled = false;
+      // A system mute is the only unambiguous notice the page gets that iOS
+      // took the audio session away, so it is what arms the recovery. Page
+      // visibility alone is not: a desktop tab switch would then tear down and
+      // rebuild every speaker element for nothing.
+      audioRecoveryNeeded = true;
       browserLog('microphone muted by system', { muted: audioTrack.muted, enabled: audioTrack.enabled, readyState: audioTrack.readyState });
     };
     audioTrack.onunmute = () => {
@@ -300,6 +417,7 @@ async function captureMicrophone(restart = false) {
       // paused every speaker element, so restart those too.
       void requestWakeLock();
       void resumeSpeakerPlayback('microphone unmuted');
+      maybeRecoverAudio('microphone unmuted');
     };
   }
   browserLog('microphone capture enabled');
@@ -436,7 +554,7 @@ async function makeOffer(speakerCount = 1) {
     container.dataset.mid = transceiver?.mid ?? '';
     container.append(heading, volume, audio);
     speakers.append(container);
-    speakerAudio.add(audio);
+    speakerAudio.set(audio, track);
     // A track that arrives while the audio session is interrupted cannot
     // autoplay, so ask for playback explicitly rather than trusting the
     // autoplay attribute.
@@ -540,6 +658,8 @@ function connectSignalling() {
       scheduleReconnect();
     } else {
       stopMicrophone();
+      stopAudioProbe();
+      audioRecoveryNeeded = false;
       setStatus(`Disconnected (${code})`);
     }
   };
@@ -559,6 +679,8 @@ form.addEventListener('submit', async (event) => {
     window.clearInterval(heartbeat);
     window.clearInterval(statsTimer);
     stopMicrophone();
+    stopAudioProbe();
+    audioRecoveryNeeded = false;
     setConnectionActive(false);
     channelSelect.disabled = true;
     void releaseWakeLock();
@@ -595,5 +717,8 @@ form.addEventListener('submit', async (event) => {
   // the Connect button press. Safari on iOS requires transient activation
   // for navigator.wakeLock.request('screen').
   void acquireWakeLock();
+  // Same reason: a context created outside a gesture starts suspended, which
+  // would be indistinguishable from the interruption it exists to report.
+  startAudioProbe();
   connectSignalling();
 });
