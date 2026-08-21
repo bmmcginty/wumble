@@ -9,6 +9,7 @@ let peer;
 let heartbeat;
 let statsTimer;
 let microphoneStream;
+let systemMicrophoneMuted = false;
 let renegotiationRequested = false;
 let renegotiationInProgress = false;
 let connectionOptions;
@@ -398,20 +399,26 @@ async function captureMicrophone(restart = false) {
     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     video: false,
   });
-  const audioTrack = microphoneStream.getAudioTracks()[0];
+  const capturedStream = microphoneStream;
+  const audioTrack = capturedStream.getAudioTracks()[0];
+  systemMicrophoneMuted = audioTrack?.muted ?? false;
   if (audioTrack) {
     audioTrack.onmute = () => {
-      audioTrack.enabled = false;
+      if (microphoneStream !== capturedStream) return;
+      systemMicrophoneMuted = true;
       // A system mute is the only unambiguous notice the page gets that iOS
       // took the audio session away, so it is what arms the recovery. Page
       // visibility alone is not: a desktop tab switch would then tear down and
       // rebuild every speaker element for nothing.
       audioRecoveryNeeded = true;
       browserLog('microphone muted by system', { muted: audioTrack.muted, enabled: audioTrack.enabled, readyState: audioTrack.readyState });
+      if (socket?.readyState === WebSocket.OPEN) signal({ type: 'microphone_state', muted: true });
     };
     audioTrack.onunmute = () => {
-      audioTrack.enabled = true;
+      if (microphoneStream !== capturedStream) return;
+      systemMicrophoneMuted = false;
       browserLog('microphone unmuted by system', { muted: audioTrack.muted, enabled: audioTrack.enabled, readyState: audioTrack.readyState });
+      if (socket?.readyState === WebSocket.OPEN) signal({ type: 'microphone_state', muted: false });
       // iOS may release the wake lock during a system audio interruption;
       // try to re-acquire when the mic is restored. The same interruption
       // paused every speaker element, so restart those too.
@@ -424,8 +431,14 @@ async function captureMicrophone(restart = false) {
 }
 
 function stopMicrophone() {
-  microphoneStream?.getTracks().forEach((track) => track.stop());
+  const stream = microphoneStream;
   microphoneStream = undefined;
+  stream?.getTracks().forEach((track) => {
+    track.onmute = null;
+    track.onunmute = null;
+    track.stop();
+  });
+  systemMicrophoneMuted = false;
 }
 
 async function sendOffer() {
@@ -621,6 +634,9 @@ function connectSignalling() {
       setStatus('Connected');
       setConnectionActive(true);
       channelSelect.disabled = false;
+      // A mute can outlive a signalling reconnect, so synchronize the new
+      // gateway session even when iOS does not emit another mute event.
+      if (systemMicrophoneMuted) signal({ type: 'microphone_state', muted: true });
       void requestWakeLock();
       await attemptRenegotiation();
     } else if (message.type === 'renegotiate') {

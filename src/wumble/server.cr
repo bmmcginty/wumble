@@ -28,6 +28,8 @@ module Wumble
       peer = nil.as(Peer?)
       mumble = nil.as(MumbleConnection?)
       active_channel = nil.as(UInt32?)
+      browser_audio_enabled = Atomic(Bool).new(true)
+      mic_state_events = Channel(Bool).new(8)
       # Signalling is now emitted from the Mumble TCP fiber (on_state), the
       # Mumble UDP voice fiber (a speaker heard before its UserState) and the
       # answer fiber. Serialize the frames so they cannot interleave, and
@@ -47,7 +49,9 @@ module Wumble
       # speaker first heard on the voice fiber must still get the browser to
       # offer an audio section for it.
       wire_peer = ->(new_peer : Peer) do
-        new_peer.on_opus { |opus, frame_number| mumble.not_nil!.send_opus(opus, frame_number) }
+        new_peer.on_opus do |opus, frame_number|
+          mumble.not_nil!.send_opus(opus, frame_number) if browser_audio_enabled.get
+        end
         new_peer.on_renegotiation_needed do
           STDERR.puts "WebRTC signalling: requesting renegotiation for new speaker"
           # This can fire from the Mumble UDP voice fiber. Hand the send to a
@@ -56,6 +60,35 @@ module Wumble
           # ordering against other frames does not matter.
           spawn { send_signal.call({type: "renegotiate"}.to_json) }
         end
+      end
+      # Serialize state cues so quick iOS mute/unmute events cannot overlap.
+      # Browser audio is gated for the whole transition, preventing live mic
+      # packets from interleaving with generated cue packets.
+      spawn do
+        last_muted = false
+        loop do
+          muted = mic_state_events.receive
+          next if muted == last_muted
+          last_muted = muted
+          connection = mumble
+          next unless connection
+          begin
+            browser_audio_enabled.set(false)
+            if muted
+              connection.play_mic_state_cue(true)
+              connection.set_self_muted(true)
+            else
+              connection.set_self_muted(false)
+              connection.play_mic_state_cue(false)
+              browser_audio_enabled.set(true)
+            end
+          rescue ex
+            browser_audio_enabled.set(true) unless muted
+            STDERR.puts "Mumble mic state transition failed: #{ex.message || ex.class.name}"
+            STDERR.puts ex.backtrace.join('\n') if ENV["WUMBLE_DEBUG"]? == "1"
+          end
+        end
+      rescue Channel::ClosedError
       end
       socket.on_message do |message|
         begin
@@ -69,6 +102,8 @@ module Wumble
             STDERR.puts "WebRTC client: #{event} #{details}"
           when "ping"
             send_signal.call({type: "pong"}.to_json)
+          when "microphone_state"
+            mic_state_events.send(data["muted"].as_bool)
           when "connect"
             raise "already connected" if peer
             request = ConnectRequest.from_json(data["options"].to_json)
@@ -181,6 +216,7 @@ module Wumble
       end
       socket.on_close do |code, reason|
         STDERR.puts "WebRTC signalling: WebSocket closed (#{code}: #{reason.inspect}); closing Mumble connection"
+        mic_state_events.close
         mumble.try &.close
         peer.try &.close
       end

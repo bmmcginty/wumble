@@ -6,7 +6,7 @@ Every Mumble Opus voice packet is put into an RTP packet and sent on the WebRTC 
 
 ## Prerequisites
 
-Install Crystal and the libdatachannel C library and headers through your operating system package manager. The library must be visible to the linker as `libdatachannel`.
+Install Crystal plus the libdatachannel and libopus C libraries and headers through your operating system package manager. The libraries must be visible to the linker as `libdatachannel` and `libopus`.
 
 ```sh
 crystal spec
