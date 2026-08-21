@@ -68,12 +68,10 @@ module Wumble
       @closed = false
       @udp_unavailable = false
       @session = nil.as(UInt32?)
-      @control_send_lock = Mutex.new
       @voice_send_lock = Mutex.new
       @next_voice_frame = 0_u32
       @browser_frame_offset = 0_u32
       @realign_browser_frame = false
-      @self_mute_updates = Channel(Bool).new(8)
     end
 
     def on_voice(&block : UInt32, Bytes, UInt32? ->)
@@ -156,37 +154,20 @@ module Wumble
 
     # The cue is transmitted as ordinary Opus voice so every Mumble client
     # hears the same state transition. Muting uses high-to-low; unmuting uses
-    # low-to-high. The caller controls whether self_mute changes before or after
-    # this method, because a muted Murmur session cannot transmit the cue.
+    # low-to-high. It does not alter Mumble self-mute state.
     def play_mic_state_cue(muted : Bool)
       frequencies = muted ? {880.0, 440.0} : {440.0, 880.0}
-      OpusTone.each_two_tone(frequencies[0], frequencies[1]) do |opus|
-        @voice_send_lock.synchronize do
+      # Keep the cue contiguous in the single outgoing Opus stream. Browser
+      # packets are not dropped or disabled; a packet arriving during these
+      # 320 ms waits briefly and is sent immediately after the cue.
+      @voice_send_lock.synchronize do
+        OpusTone.each_two_tone(frequencies[0], frequencies[1]) do |opus|
           send_voice_packet(opus, @next_voice_frame)
           @next_voice_frame &+= 2_u32
+          sleep 20.milliseconds
         end
-        sleep 20.milliseconds
-      end
-      @voice_send_lock.synchronize do
         send_voice_terminator(@next_voice_frame)
         @realign_browser_frame = true
-      end
-    end
-
-    def set_self_muted(muted : Bool)
-      send_packet(USER_STATE, Protobuf.field(9, muted ? 1_u64 : 0_u64))
-      STDERR.puts "Mumble: requested self_mute=#{muted}"
-      loop do
-        select
-        when state = @self_mute_updates.receive
-          if state == muted
-            STDERR.puts "Mumble: confirmed self_mute=#{muted}"
-            return
-          end
-        when timeout(1.second)
-          STDERR.puts "Mumble: timed out waiting for self_mute=#{muted} confirmation"
-          return
-        end
       end
     end
 
@@ -270,16 +251,14 @@ module Wumble
     end
 
     private def send_packet(type : Int32, payload : Bytes)
-      @control_send_lock.synchronize do
-        io = @io.not_nil!
-        header = Bytes.new(6)
-        IO::ByteFormat::BigEndian.encode(type.to_u16, header[0, 2])
-        IO::ByteFormat::BigEndian.encode(payload.size.to_u32, header[2, 4])
-        STDERR.puts "Mumble: sent #{packet_name(type)} (#{payload.size} bytes)"
-        io.write(header)
-        io.write(payload)
-        io.flush
-      end
+      io = @io.not_nil!
+      header = Bytes.new(6)
+      IO::ByteFormat::BigEndian.encode(type.to_u16, header[0, 2])
+      IO::ByteFormat::BigEndian.encode(payload.size.to_u32, header[2, 4])
+      STDERR.puts "Mumble: sent #{packet_name(type)} (#{payload.size} bytes)"
+      io.write(header)
+      io.write(payload)
+      io.flush
     end
 
     private def read_loop
@@ -481,13 +460,11 @@ module Wumble
       session = nil.as(UInt32?)
       name = nil.as(String?)
       channel = nil.as(UInt32?)
-      self_muted = nil.as(Bool?)
       Protobuf.fields(payload) do |number, wire, value|
         case number
         when 1 then session = Protobuf.read_varint(value, 0)[0].to_u32 if wire == 0
         when 3 then name = String.new(value) if wire == 2
         when 5 then channel = Protobuf.read_varint(value, 0)[0].to_u32 if wire == 0
-        when 9 then self_muted = Protobuf.read_varint(value, 0)[0] != 0 if wire == 0
         end
       end
       if session
@@ -501,7 +478,6 @@ module Wumble
           @user_channels[session.not_nil!] = 0_u32
         end
         @on_user.try &.call(session.not_nil!, name.not_nil!) if name
-        @self_mute_updates.send(self_muted.not_nil!) if session == @session && !self_muted.nil?
         @on_state.try &.call
       end
     end

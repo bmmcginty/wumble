@@ -406,6 +406,7 @@ async function captureMicrophone(restart = false) {
     audioTrack.onmute = () => {
       if (microphoneStream !== capturedStream) return;
       systemMicrophoneMuted = true;
+      audioTrack.enabled = false;
       // A system mute is the only unambiguous notice the page gets that iOS
       // took the audio session away, so it is what arms the recovery. Page
       // visibility alone is not: a desktop tab switch would then tear down and
@@ -417,6 +418,7 @@ async function captureMicrophone(restart = false) {
     audioTrack.onunmute = () => {
       if (microphoneStream !== capturedStream) return;
       systemMicrophoneMuted = false;
+      audioTrack.enabled = true;
       browserLog('microphone unmuted by system', { muted: audioTrack.muted, enabled: audioTrack.enabled, readyState: audioTrack.readyState });
       if (socket?.readyState === WebSocket.OPEN) signal({ type: 'microphone_state', muted: false });
       // iOS may release the wake lock during a system audio interruption;
