@@ -30,6 +30,7 @@ lib LibDataChannel
   fun rtc_create_peer_connection = rtcCreatePeerConnection(config : Configuration*) : Handle
   fun rtc_delete_peer_connection = rtcDeletePeerConnection(pc : Handle)
   fun rtc_set_remote_description = rtcSetRemoteDescription(pc : Handle, sdp : UInt8*, type : UInt8*) : Int32
+  fun rtc_set_local_description = rtcSetLocalDescription(pc : Handle, type : UInt8*) : Int32
   fun rtc_add_remote_candidate = rtcAddRemoteCandidate(pc : Handle, candidate : UInt8*, mid : UInt8*) : Int32
   fun rtc_get_local_description = rtcGetLocalDescription(pc : Handle, buffer : UInt8*, size : Int32) : Int32
   fun rtc_get_local_address = rtcGetLocalAddress(pc : Handle, buffer : UInt8*, size : Int32) : Int32
@@ -138,6 +139,15 @@ module Wumble
       # libdatachannel requires a real (zero-initialized) configuration to use
       # its defaults; passing NULL segfaults in libdatachannel 0.24.
       config = LibDataChannel::Configuration.new
+      # Build the answer ourselves once the tracks for the offer exist. With
+      # libdatachannel's automatic negotiation, setting the remote offer also
+      # produces the answer, so a track added afterwards is missing from it:
+      # the section is still reciprocated as sendonly, but without the
+      # "a=ssrc:" line that tells the browser which RTP stream belongs to it.
+      # The browser then has no mapping for that speaker's packets and drops
+      # every one of them until some later negotiation republishes the section
+      # -- the "a speaker who joins is silent until somebody else joins" bug.
+      config.disable_auto_negotiation = true
       @browser_fallback_frame_number = 0_u32
       @browser_first_rtp_timestamp = nil.as(UInt32?)
       @browser_packets = 0_u64
@@ -178,7 +188,13 @@ module Wumble
       @mid_extension_ids = mid_extension_ids(sdp)
       result = LibDataChannel.rtc_set_remote_description(@pc, sdp.to_unsafe, "offer".to_unsafe)
       raise "rtcSetRemoteDescription failed (#{result})" if result < 0
-      @speaker_tracks.accept_offer(payload_types) { |session, mid| add_speaker_track(session, mid) }
+      needs_renegotiation = @speaker_tracks.accept_offer(payload_types) { |session, mid| add_speaker_track(session, mid) }
+      # Only now, with every speaker this offer made room for bridged, does the
+      # answer describe all of them. Automatic negotiation is disabled so that
+      # this is the one place an answer is produced.
+      result = LibDataChannel.rtc_set_local_description(@pc, "answer".to_unsafe)
+      raise "rtcSetLocalDescription failed (#{result})" if result < 0
+      needs_renegotiation
     end
 
     def add_candidate(candidate : String, mid : String)
@@ -195,8 +211,17 @@ module Wumble
     # request would latch that flag with no offer ever arriving to clear it,
     # starving every later speaker of a track for the life of this Peer.
     def request_speaker(session : UInt32) : Nil
-      needed = @speaker_tracks.add(session) { |speaker, mid| add_speaker_track(speaker, mid) }
-      @on_renegotiation_needed.try &.call if needed
+      added = false
+      needed = @speaker_tracks.add(session) do |speaker, mid|
+        created = add_speaker_track(speaker, mid)
+        added ||= created
+        created
+      end
+      # A track claiming a section the browser had already offered is created
+      # outside accept_offer, so the answer the browser is holding predates it
+      # and never named its SSRC. Ask for an offer anyway: the answer to it is
+      # what publishes the mapping this speaker's RTP needs.
+      @on_renegotiation_needed.try &.call if needed || added
     end
 
     # Do not use libdatachannel's callbacks here. They run on its native C++
@@ -460,7 +485,16 @@ module Wumble
       # gateway-to-browser speaker audio; the remaining speaker tracks are
       # receive-only in the browser and stay sendonly here.
       direction = mid == "0" ? "sendrecv" : "sendonly"
-      sdp = "m=audio 9 UDP/TLS/RTP/SAVPF #{payload_type}\r\na=mid:#{mid}\r\na=#{direction}\r\na=rtpmap:#{payload_type} opus/48000/2\r\na=fmtp:#{payload_type} minptime=10;useinbandfec=1\r\na=ssrc:#{session} cname:wumble-#{session}\r\n"
+      # forward_opus stamps every packet with the MID header extension, so
+      # answer with the extension the offer assigned to this section. Without
+      # it the browser has only the SSRC to route BUNDLE'd audio by, which
+      # leaves a speaker silent whenever that mapping is not in place yet.
+      extmap = if extension_id = @mid_extension_ids[mid]?
+                 "a=extmap:#{extension_id} urn:ietf:params:rtp-hdrext:sdes:mid\r\n"
+               else
+                 ""
+               end
+      sdp = "m=audio 9 UDP/TLS/RTP/SAVPF #{payload_type}\r\na=mid:#{mid}\r\na=#{direction}\r\n#{extmap}a=rtpmap:#{payload_type} opus/48000/2\r\na=fmtp:#{payload_type} minptime=10;useinbandfec=1\r\na=ssrc:#{session} cname:wumble-#{session}\r\n"
       track = LibDataChannel.rtc_add_track(@pc, sdp.to_unsafe)
       if track < 0
         STDERR.puts "WebRTC: rtcAddTrack failed (#{track}) for session=#{session} mid=#{mid}"
