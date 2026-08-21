@@ -161,28 +161,22 @@ async function resumeSpeakerPlayback(reason) {
 // energy -- while nothing reaches the speaker, and no element event fires.
 // Pointing each element at a fresh MediaStream over the same track is the only
 // way from script to make Safari build a new renderer for it.
-let reattachRunning = false;
 async function reattachSpeakerAudio(reason) {
-  if (!speakerAudio.size || reattachRunning) return;
-  reattachRunning = true;
-  try {
-    browserLog('reattaching speaker audio', { reason, speakers: speakerAudio.size });
-    for (const [audio, track] of speakerAudio) {
-      try {
-        audio.srcObject = null;
-        audio.srcObject = new MediaStream([track]);
-        await audio.play();
-      } catch (error) {
-        browserLog('speaker reattach failed', {
-          reason,
-          session: audio.dataset.session || null,
-          message: String(error),
-          name: error.name,
-        });
-      }
+  if (!speakerAudio.size) return;
+  browserLog('reattaching speaker audio', { reason, speakers: speakerAudio.size });
+  for (const [audio, track] of speakerAudio) {
+    try {
+      audio.srcObject = null;
+      audio.srcObject = new MediaStream([track]);
+      await audio.play();
+    } catch (error) {
+      browserLog('speaker reattach failed', {
+        reason,
+        session: audio.dataset.session || null,
+        message: String(error),
+        name: error.name,
+      });
     }
-  } finally {
-    reattachRunning = false;
   }
 }
 
@@ -563,12 +557,8 @@ async function makeOffer(speakerCount = 1) {
     speakerAudio.set(audio, track);
     // A track that arrives while the audio session is interrupted cannot
     // autoplay, so ask for playback explicitly rather than trusting the
-    // autoplay attribute. A new track landing also proves the page's WebRTC
-    // audio path is alive right now, which is a safe, cheap moment to rebuild
-    // every other speaker's renderer too: Safari can leave an existing
-    // element reporting itself as playing while silently detached from the
-    // speaker, with no signal other than a fresh MediaStream to repair it.
-    void reattachSpeakerAudio('remote track added').then(() => resumeSpeakerPlayback('remote track added'));
+    // autoplay attribute.
+    void resumeSpeakerPlayback('remote track added');
     track.onended = () => { browserLog('remote track ended', { id: track.id, session: speaker?.session ?? null }); removeSpeakerArticle(container); };
   };
   await sendOffer();
