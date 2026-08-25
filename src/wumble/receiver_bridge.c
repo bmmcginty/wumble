@@ -22,6 +22,11 @@ typedef struct {
     pthread_mutex_t lock;
     _Atomic uint64_t received;
     _Atomic uint64_t queued;
+    /* libdatachannel only reports connection state through callbacks on its
+     * own threads. Latch the latest values here so Crystal can poll them from
+     * a normal fiber, the same reason media packets go through the pipe. */
+    _Atomic int peer_state;
+    _Atomic int ice_state;
 } wumble_receiver;
 
 /*
@@ -95,6 +100,18 @@ static void on_message(int track, const char *message, int size, void *ptr) {
     pthread_mutex_unlock(&receiver->lock);
 }
 
+static void on_state_change(int pc, rtcState state, void *ptr) {
+    (void)pc;
+    wumble_receiver *receiver = ptr;
+    if (receiver) atomic_store(&receiver->peer_state, (int)state);
+}
+
+static void on_ice_state_change(int pc, rtcIceState state, void *ptr) {
+    (void)pc;
+    wumble_receiver *receiver = ptr;
+    if (receiver) atomic_store(&receiver->ice_state, (int)state);
+}
+
 static void on_track(int pc, int track, void *ptr) {
     (void)pc;
     wumble_receiver *receiver = ptr;
@@ -134,8 +151,12 @@ int wumble_receiver_start(int pc) {
     }
     receiver->read_fd = fds[0];
     receiver->write_fd = fds[1];
+    atomic_store(&receiver->peer_state, (int)RTC_NEW);
+    atomic_store(&receiver->ice_state, (int)RTC_ICE_NEW);
     pthread_mutex_init(&receiver->lock, NULL);
     rtcSetUserPointer(pc, receiver);
+    rtcSetStateChangeCallback(pc, on_state_change);
+    rtcSetIceStateChangeCallback(pc, on_ice_state_change);
     if (rtcSetTrackCallback(pc, on_track) < 0) {
         close(fds[0]);
         close(fds[1]);
@@ -154,6 +175,16 @@ uint64_t wumble_receiver_received(int pc) {
 uint64_t wumble_receiver_queued(int pc) {
     wumble_receiver *receiver = rtcGetUserPointer(pc);
     return receiver ? atomic_load(&receiver->queued) : 0;
+}
+
+int wumble_peer_state(int pc) {
+    wumble_receiver *receiver = rtcGetUserPointer(pc);
+    return receiver ? atomic_load(&receiver->peer_state) : (int)RTC_NEW;
+}
+
+int wumble_ice_state(int pc) {
+    wumble_receiver *receiver = rtcGetUserPointer(pc);
+    return receiver ? atomic_load(&receiver->ice_state) : (int)RTC_ICE_NEW;
 }
 
 void wumble_receiver_stop(int pc) {

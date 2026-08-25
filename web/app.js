@@ -23,6 +23,13 @@ const currentChannelSessions = new Set();
 // Element -> the remote track it plays. The track is kept because reattaching
 // after an interruption has to build a new MediaStream around the same track.
 const speakerAudio = new Map();
+// mid -> the remote track and stream ontrack delivered for that m= section.
+// Offered sections outnumber speakers (see SPARE_SPEAKER_SECTIONS), so a
+// section can receive its track long before the gateway assigns a speaker to
+// it. ontrack fires once per section and never again, so the track has to be
+// held here until there is a speaker to build an element for.
+const remoteTracksByMid = new Map();
+const SPARE_SPEAKER_SECTIONS = 6;
 let playbackResumeRunning = false;
 let audioProbe;
 let audioRecoveryRunning = false;
@@ -137,7 +144,7 @@ async function resumeSpeakerPlayback(reason) {
       browserLog('resuming speaker playback', { reason, attempt, paused: paused.length });
       for (const audio of paused) {
         try {
-          await audio.play();
+          await playWithTimeout(audio);
         } catch (error) {
           browserLog('speaker playback resume failed', {
             reason,
@@ -156,6 +163,23 @@ async function resumeSpeakerPlayback(reason) {
   }
 }
 
+// iOS can hand back a play() or resume() promise that never settles while it
+// still holds the audio session. Every await on the recovery path goes through
+// this, because one unsettling promise used to strand the whole recovery.
+const TIMED_OUT = Symbol('timed out');
+const PLAY_TIMEOUT_MS = 2_000;
+const AUDIO_RESUME_TIMEOUT_MS = 3_000;
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => window.setTimeout(() => resolve(TIMED_OUT), ms)),
+  ]);
+}
+
+function playWithTimeout(audio) {
+  return withTimeout(audio.play(), PLAY_TIMEOUT_MS);
+}
+
 // Pausing and playing is only a repair for an element Safari itself stopped.
 // After a Siri interruption the elements come back reporting that they are
 // playing -- currentTime keeps advancing and inbound-rtp keeps reporting audio
@@ -169,7 +193,10 @@ async function reattachSpeakerAudio(reason) {
     try {
       audio.srcObject = null;
       audio.srcObject = new MediaStream([track]);
-      await audio.play();
+      // iOS can return a play() promise that never settles while it still holds
+      // the audio session. Awaiting it unbounded would stall this loop and
+      // leave every later speaker un-reattached.
+      await playWithTimeout(audio);
     } catch (error) {
       browserLog('speaker reattach failed', {
         reason,
@@ -181,14 +208,53 @@ async function reattachSpeakerAudio(reason) {
   }
 }
 
+// A connect binds new audio elements while iOS may still be rebuilding the
+// audio session the previous connection tore down. The elements then report
+// playing -- readyState 4, currentTime advancing, inbound-rtp showing real
+// audio energy -- while nothing reaches the speaker: the same silent-renderer
+// state a Siri interruption leaves behind, reached by a different route.
+// Nothing on the connect path detects it, because the elements are not paused
+// and so resumeSpeakerPlayback is a no-op. Rebuild them unconditionally once
+// the session has had a moment to settle; twice, because how long that takes
+// is not observable from script.
+let connectReattachTimers = [];
+function cancelConnectReattach() {
+  for (const timer of connectReattachTimers) window.clearTimeout(timer);
+  connectReattachTimers = [];
+}
+
+function scheduleConnectReattach(reason) {
+  cancelConnectReattach();
+  for (const delay of [250, 1_500]) {
+    connectReattachTimers.push(window.setTimeout(() => {
+      if (!connectionActive) return;
+      void reattachSpeakerAudio(reason);
+    }, delay));
+  }
+}
+
 // Rebuild what the interruption tore down, in dependency order: the audio
 // session first, then the elements that render into it. Resuming the context
 // alone was tried and is not enough -- it returns to 'running' and the speakers
 // stay silent -- so the context state is a reliable detector of the
 // interruption, and the reattach is the repair.
+const AUDIO_RECOVERY_TIMEOUT_MS = 10_000;
+let audioRecoveryWatchdog;
 async function recoverAudio(reason) {
   if (audioRecoveryRunning || !connectionActive) return;
   audioRecoveryRunning = true;
+  // This flag gates every future recovery, so it must never depend on a
+  // promise settling. A resume() that never returned used to leave it latched
+  // true for the life of the page, silently disabling recovery from then on.
+  window.clearTimeout(audioRecoveryWatchdog);
+  audioRecoveryWatchdog = window.setTimeout(() => {
+    if (!audioRecoveryRunning) return;
+    audioRecoveryRunning = false;
+    // Whatever it was waiting on never arrived, so leave recovery armed for
+    // the next visibility or focus event to retry.
+    audioRecoveryNeeded = true;
+    browserLog('audio recovery timed out', { reason, audioContext: audioProbe?.state ?? null });
+  }, AUDIO_RECOVERY_TIMEOUT_MS);
   try {
     browserLog('audio recovery starting', {
       reason,
@@ -203,6 +269,8 @@ async function recoverAudio(reason) {
   } catch (error) {
     browserError('audio recovery failed', { reason, message: String(error), name: error.name });
   } finally {
+    window.clearTimeout(audioRecoveryWatchdog);
+    audioRecoveryWatchdog = undefined;
     audioRecoveryRunning = false;
   }
 }
@@ -246,8 +314,12 @@ async function resumeAudioProbe(reason) {
   if (!audioProbe || audioProbe.state === 'running') return;
   browserLog('audio context resuming', { reason, state: audioProbe.state });
   try {
-    await audioProbe.resume();
-    browserLog('audio context resumed', { reason, state: audioProbe.state });
+    const outcome = await withTimeout(audioProbe.resume(), AUDIO_RESUME_TIMEOUT_MS);
+    if (outcome === TIMED_OUT) {
+      browserLog('audio context resume timed out', { reason, state: audioProbe?.state ?? null });
+    } else {
+      browserLog('audio context resumed', { reason, state: audioProbe?.state ?? null });
+    }
   } catch (error) {
     browserLog('audio context resume failed', { reason, state: audioProbe.state, message: String(error), name: error.name });
   }
@@ -270,6 +342,86 @@ function clearSpeakerArticles() {
   speakers.replaceChildren();
   speakerAudio.clear();
   speakerInfoByMid.clear();
+  remoteTracksByMid.clear();
+}
+
+function labelSpeakerArticle(article, speaker) {
+  const label = `${speaker.name} (session ${speaker.session})`;
+  article.dataset.session = String(speaker.session);
+  const heading = article.querySelector('h2');
+  if (heading) heading.textContent = label;
+  const audio = article.querySelector('audio');
+  if (audio) {
+    audio.title = label;
+    audio.dataset.session = String(speaker.session);
+  }
+}
+
+function createSpeakerArticle(mid, { track, stream }, speaker, reason) {
+  const label = `${speaker.name} (session ${speaker.session})`;
+  browserLog('building speaker element', { mid, session: speaker.session, reason });
+  const container = document.createElement('article');
+  const heading = document.createElement('h2');
+  heading.textContent = label;
+  const audio = document.createElement('audio');
+  audio.autoplay = true;
+  audio.controls = true;
+  audio.title = label;
+  audio.srcObject = stream;
+  audio.dataset.trackId = track.id;
+  audio.dataset.session = String(speaker.session);
+  const volume = document.createElement('input');
+  volume.type = 'range';
+  volume.min = '0';
+  volume.max = '100';
+  volume.step = '1';
+  volume.value = '100';
+  volume.setAttribute('aria-label', 'Volume');
+  volume.addEventListener('change', () => {
+    const percent = Number(volume.value);
+    audio.volume = Number.isFinite(percent) ? Math.min(100, Math.max(0, percent)) / 100 : 1;
+  });
+  audio.onplaying = () => browserLog('speaker audio playing', { track: track.id, session: speaker.session, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
+  audio.onwaiting = () => {
+    browserLog('speaker audio waiting', { track: track.id, session: speaker.session, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
+    void resumeSpeakerPlayback('speaker audio waiting');
+  };
+  audio.onstalled = () => {
+    browserLog('speaker audio stalled', { track: track.id, session: speaker.session });
+    void resumeSpeakerPlayback('speaker audio stalled');
+  };
+  audio.onerror = () => browserLog('speaker audio error', { track: track.id, session: speaker.session, error: audio.error?.message });
+  track.onmute = () => browserLog('remote track muted', { id: track.id, session: speaker.session });
+  track.onunmute = () => browserLog('remote track unmuted', { id: track.id, session: speaker.session });
+  container.dataset.session = String(speaker.session);
+  container.dataset.mid = mid;
+  container.append(heading, volume, audio);
+  speakers.append(container);
+  speakerAudio.set(audio, track);
+  // A track that arrives while the audio session is interrupted cannot
+  // autoplay, so ask for playback explicitly rather than trusting the
+  // autoplay attribute.
+  void resumeSpeakerPlayback('speaker element added');
+}
+
+// One article per assigned m= section. This runs both when a track arrives and
+// when an answer assigns a speaker to a section whose track arrived earlier;
+// the second case is the one spare sections made possible, and nothing else
+// would ever build an element for it.
+function syncSpeakerArticles(reason) {
+  const existingByMid = new Map();
+  for (const article of speakers.querySelectorAll('article')) existingByMid.set(article.dataset.mid, article);
+  for (const [mid, entry] of remoteTracksByMid) {
+    const speaker = speakerInfoByMid.get(mid);
+    // A spare section the gateway has not assigned to anybody yet.
+    if (!speaker) continue;
+    // The gateway never forgets a mid, so the channel roster is what decides
+    // whether that speaker should still be on screen.
+    if (currentChannelSessions.size && !currentChannelSessions.has(String(speaker.session))) continue;
+    const existing = existingByMid.get(mid);
+    if (existing) labelSpeakerArticle(existing, speaker);
+    else createSpeakerArticle(mid, entry, speaker, reason);
+  }
 }
 
 async function acquireWakeLock() {
@@ -367,10 +519,29 @@ function updateChannels({ current_channel: currentChannel, channels, users }) {
 channelSelect.addEventListener('change', () => {
   if (connectionActive && channelSelect.value) signal({ type: 'switch_channel', channel: Number(channelSelect.value) });
 });
+// Everything the page does before connectSignalling() -- the microphone
+// capture and the audio probe, which is exactly the window the connect-time
+// silent-renderer bug lives in -- runs while socket is undefined. Dropping
+// those lines left the gateway log with no record of the only part of a
+// connect that can differ between a working and a silent one, so hold them
+// until the socket opens instead.
+const pendingLogs = [];
+const PENDING_LOG_LIMIT = 200;
 function browserLog(event, details = {}) {
   details.time = Date.now();
   console.info(`Wumble: ${event}`, details);
-  if (socket?.readyState === WebSocket.OPEN) signal({ type: 'log', event, details });
+  if (socket?.readyState === WebSocket.OPEN) {
+    signal({ type: 'log', event, details });
+    return;
+  }
+  pendingLogs.push({ type: 'log', event, details });
+  // A page that never connects must not grow this without bound.
+  if (pendingLogs.length > PENDING_LOG_LIMIT) pendingLogs.shift();
+}
+
+function flushPendingLogs() {
+  if (socket?.readyState !== WebSocket.OPEN || !pendingLogs.length) return;
+  for (const entry of pendingLogs.splice(0, pendingLogs.length)) signal(entry);
 }
 const nativeConsoleError = console.error.bind(console);
 console.error = (...values) => {
@@ -389,8 +560,23 @@ window.addEventListener('unhandledrejection', ({ reason }) => {
   browserError('unhandled promise rejection', { reason: String(reason) });
 });
 
+// A user-initiated disconnect retains the capture (see suspendMicrophone), so
+// re-arm that track rather than asking iOS for a new one. Stopping the last
+// capture track tears down the page's audio session, and re-requesting it
+// immediately is what races the new speaker elements into a dead renderer.
 async function captureMicrophone(restart = false) {
-  if (microphoneStream?.active && !restart) return;
+  if (microphoneStream?.active && !restart) {
+    const retained = microphoneStream.getAudioTracks()[0];
+    if (retained?.readyState === 'live') {
+      systemMicrophoneMuted = retained.muted;
+      retained.enabled = !retained.muted;
+      browserLog('microphone capture reused', { muted: retained.muted, enabled: retained.enabled });
+      return;
+    }
+    // iOS can end a retained track on its own; fall through and recapture.
+    browserLog('retained microphone capture was no longer live');
+    stopMicrophone();
+  }
   if (restart) stopMicrophone();
   if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone capture is not supported by this browser');
   // This is intentionally requested inside the Connect tap. While Safari is
@@ -432,6 +618,20 @@ async function captureMicrophone(restart = false) {
   browserLog('microphone capture enabled');
 }
 
+// Disconnect without destroying the audio session. The capture stays live and
+// only stops transmitting, which keeps iOS from tearing the session down and
+// rebuilding it under the next connect's audio elements. The cost is that the
+// system microphone indicator stays lit while disconnected.
+function suspendMicrophone() {
+  const audioTrack = microphoneStream?.getAudioTracks()[0];
+  if (!audioTrack || audioTrack.readyState !== 'live') {
+    stopMicrophone();
+    return;
+  }
+  audioTrack.enabled = false;
+  browserLog('microphone capture retained', { muted: audioTrack.muted, readyState: audioTrack.readyState });
+}
+
 function stopMicrophone() {
   const stream = microphoneStream;
   microphoneStream = undefined;
@@ -443,10 +643,75 @@ function stopMicrophone() {
   systemMicrophoneMuted = false;
 }
 
-async function sendOffer() {
-  const offer = await peer.createOffer({ offerToReceiveAudio: true });
+async function sendOffer(options = {}) {
+  const offer = await peer.createOffer({ offerToReceiveAudio: true, ...options });
   await peer.setLocalDescription(offer);
   signal({ type: 'offer', sdp: offer.sdp });
+}
+
+// Recovering the path always beats tearing the session down. Closing the
+// socket drops the Mumble connection, which re-authenticates and hands every
+// speaker a new session ID and SSRC; an ICE restart keeps all of that.
+const ICE_RESTART_DELAY_MS = 4_000;
+const ICE_RESTART_LIMIT = 3;
+const CONNECTION_GIVE_UP_MS = 25_000;
+let iceRestartAttempts = 0;
+let iceRestartInProgress = false;
+let iceRestartTimer;
+let connectionGiveUpTimer;
+
+function clearConnectionRecovery() {
+  window.clearTimeout(iceRestartTimer);
+  window.clearTimeout(connectionGiveUpTimer);
+  iceRestartTimer = undefined;
+  connectionGiveUpTimer = undefined;
+}
+
+async function restartIce(reason) {
+  const currentPeer = peer;
+  if (!currentPeer || iceRestartInProgress) return;
+  // A restart is itself an offer, so it cannot overlap another negotiation.
+  if (currentPeer.signalingState !== 'stable') return;
+  if (iceRestartAttempts >= ICE_RESTART_LIMIT) {
+    browserLog('ICE restart limit reached; reconnecting', { reason, attempts: iceRestartAttempts });
+    socket?.close();
+    return;
+  }
+  iceRestartInProgress = true;
+  iceRestartAttempts += 1;
+  browserLog('ICE restart starting', {
+    reason,
+    attempt: iceRestartAttempts,
+    connection: currentPeer.connectionState,
+    ice: currentPeer.iceConnectionState,
+  });
+  try {
+    await sendOffer({ iceRestart: true });
+  } catch (error) {
+    browserError('ICE restart failed', { reason, message: String(error) });
+  } finally {
+    iceRestartInProgress = false;
+  }
+}
+
+// 'disconnected' is often a transient blip that the browser repairs on its
+// own, so give it a moment before restarting, and only give up on the peer
+// connection entirely once a restart has had time to work.
+function scheduleConnectionRecovery(reason, delay = ICE_RESTART_DELAY_MS) {
+  if (!iceRestartTimer) {
+    iceRestartTimer = window.setTimeout(() => {
+      iceRestartTimer = undefined;
+      void restartIce(reason);
+    }, delay);
+  }
+  if (!connectionGiveUpTimer) {
+    connectionGiveUpTimer = window.setTimeout(() => {
+      connectionGiveUpTimer = undefined;
+      if (peer?.connectionState === 'connected') return;
+      browserLog('media path did not recover; reconnecting', { reason, connection: peer?.connectionState ?? null });
+      socket?.close();
+    }, CONNECTION_GIVE_UP_MS);
+  }
 }
 
 async function attemptRenegotiation() {
@@ -469,6 +734,9 @@ async function attemptRenegotiation() {
 async function makeOffer(speakerCount = 1) {
   renegotiationRequested = false;
   renegotiationInProgress = false;
+  clearConnectionRecovery();
+  iceRestartAttempts = 0;
+  iceRestartInProgress = false;
   // Every track belongs to the PeerConnection being replaced, so drop the old
   // elements rather than leaving dead ones for updateChannels to reap.
   clearSpeakerArticles();
@@ -479,7 +747,15 @@ async function makeOffer(speakerCount = 1) {
   // microphone section would therefore be rejected as inactive. The two
   // directions still retain independent RTP streams and Opus packets.
   peer.addTransceiver(microphoneStream.getAudioTracks()[0], { direction: 'sendrecv' });
-  for (let index = 1; index < Math.max(1, speakerCount); index += 1) {
+  // Offer more receive-only sections than there are speakers. A Mumble user
+  // who joins later can then be given a track straight away instead of the
+  // gateway having to ask for another section first and wait for the offer
+  // that carries it -- the two-phase handshake every "a speaker who joins is
+  // silent" bug has come out of. Renegotiation still happens, to publish the
+  // new section's SSRC, but it can no longer fail to find a section at all.
+  // Idle sections cost nothing but a few lines of SDP.
+  const sections = Math.max(1, speakerCount) + SPARE_SPEAKER_SECTIONS;
+  for (let index = 1; index < sections; index += 1) {
     peer.addTransceiver('audio', { direction: 'recvonly' });
   }
   currentPeer.onicecandidate = ({ candidate }) => {
@@ -496,8 +772,12 @@ async function makeOffer(speakerCount = 1) {
     browserLog('peer connection state', { state: currentPeer.connectionState });
     if (currentPeer.connectionState === 'connected') {
       startMediaStats();
-    } else if (currentPeer.connectionState === 'disconnected' || currentPeer.connectionState === 'failed') {
-      socket?.close();
+      clearConnectionRecovery();
+      iceRestartAttempts = 0;
+    } else if (currentPeer.connectionState === 'disconnected') {
+      scheduleConnectionRecovery('peer connection disconnected');
+    } else if (currentPeer.connectionState === 'failed') {
+      scheduleConnectionRecovery('peer connection failed', 0);
     }
   };
   currentPeer.oniceconnectionstatechange = () => {
@@ -505,7 +785,7 @@ async function makeOffer(speakerCount = 1) {
     const details = { state: currentPeer.iceConnectionState };
     if (currentPeer.iceConnectionState === 'failed') {
       browserError('ICE failed', details);
-      socket?.close();
+      scheduleConnectionRecovery('ICE failed', 0);
     } else browserLog('ICE connection state', details);
   };
   currentPeer.onicecandidateerror = ({ url, errorCode, errorText }) => {
@@ -518,63 +798,19 @@ async function makeOffer(speakerCount = 1) {
   };
   currentPeer.ontrack = ({ track, streams, transceiver }) => {
     if (peer !== currentPeer) return;
-    const speaker = speakerInfoByMid.get(transceiver?.mid);
-    const label = speaker ? `${speaker.name} (session ${speaker.session})` : 'Unknown speaker';
-    browserLog('received remote track', { id: track.id, kind: track.kind, streams: streams.length, mid: transceiver?.mid, speaker });
+    const mid = transceiver?.mid ?? '';
+    browserLog('received remote track', { id: track.id, kind: track.kind, streams: streams.length, mid, speaker: speakerInfoByMid.get(mid) ?? null });
     // Do not combine tracks into one MediaStream. One received track means one
     // Mumble speaker and gets its own audio element and jitter buffer.
-    // A renegotiation should retain the same receiver, but Safari can emit a
-    // duplicate ontrack for an existing m= section. Keep one article per mid.
-    for (const article of speakers.querySelectorAll('article')) {
-      if (article.dataset.mid === (transceiver?.mid ?? '')) removeSpeakerArticle(article);
-    }
-    const container = document.createElement('article');
-    const heading = document.createElement('h2');
-    heading.textContent = label;
-    const audio = document.createElement('audio');
-    audio.autoplay = true;
-    audio.controls = true;
-    audio.title = label;
-    audio.srcObject = streams[0] || new MediaStream([track]);
-    audio.dataset.trackId = track.id;
-    audio.dataset.session = speaker?.session ?? '';
-//    const volumeLabel = document.createElement('label');
-//    volumeLabel.textContent = 'Volume';
-    const volume = document.createElement('input');
-    volume.type = 'range';
-    volume.min = '0';
-    volume.max = '100';
-    volume.step = '1';
-    volume.value = '100';
-    volume.setAttribute('aria-label', `Volume`);
-//Volume for ${label}`);
-    volume.addEventListener('change', () => {
-      const percent = Number(volume.value);
-      audio.volume = Number.isFinite(percent) ? Math.min(100, Math.max(0, percent)) / 100 : 1;
-    });
-//    volumeLabel.append(volume);
-    audio.onplaying = () => browserLog('speaker audio playing', { track: track.id, session: speaker?.session ?? null, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
-    audio.onwaiting = () => {
-      browserLog('speaker audio waiting', { track: track.id, session: speaker?.session ?? null, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
-      void resumeSpeakerPlayback('speaker audio waiting');
+    remoteTracksByMid.set(mid, { track, stream: streams[0] || new MediaStream([track]) });
+    track.onended = () => {
+      browserLog('remote track ended', { id: track.id, mid });
+      remoteTracksByMid.delete(mid);
+      for (const article of speakers.querySelectorAll('article')) {
+        if (article.dataset.mid === mid) removeSpeakerArticle(article);
+      }
     };
-    audio.onstalled = () => {
-      browserLog('speaker audio stalled', { track: track.id, session: speaker?.session ?? null });
-      void resumeSpeakerPlayback('speaker audio stalled');
-    };
-    audio.onerror = () => browserLog('speaker audio error', { track: track.id, session: speaker?.session ?? null, error: audio.error?.message });
-    track.onmute = () => browserLog('remote track muted', { id: track.id, session: speaker?.session ?? null });
-    track.onunmute = () => browserLog('remote track unmuted', { id: track.id, session: speaker?.session ?? null });
-    container.dataset.session = speaker?.session ?? '';
-    container.dataset.mid = transceiver?.mid ?? '';
-    container.append(heading, volume, audio);
-    speakers.append(container);
-    speakerAudio.set(audio, track);
-    // A track that arrives while the audio session is interrupted cannot
-    // autoplay, so ask for playback explicitly rather than trusting the
-    // autoplay attribute.
-    void resumeSpeakerPlayback('remote track added');
-    track.onended = () => { browserLog('remote track ended', { id: track.id, session: speaker?.session ?? null }); removeSpeakerArticle(container); };
+    syncSpeakerArticles('remote track');
   };
   await sendOffer();
 }
@@ -606,6 +842,9 @@ function connectSignalling() {
     if (socket !== currentSocket) return;
     setStatus('Connecting to Mumble…');
     signal({ type: 'connect', options: connectionOptions });
+    // Send the pre-connect backlog before this socket's own first line, so the
+    // gateway log reads in the order the page produced it.
+    flushPendingLogs();
     browserLog('signalling socket opened');
     // Keep reverse proxies from expiring an otherwise idle signalling socket.
     heartbeat = window.setInterval(() => signal({ type: 'ping' }), 20_000);
@@ -633,14 +872,28 @@ function connectSignalling() {
       for (const speaker of message.speakers || []) speakerInfoByMid.set(speaker.mid, speaker);
       await peer.setRemoteDescription({ type: message.description_type, sdp: message.sdp });
       browserLog('accepted WebRTC answer', { sdpBytes: message.sdp.length });
+      // An answer can assign a speaker to a spare section whose track arrived
+      // in an earlier negotiation; no further ontrack fires for that section.
+      syncSpeakerArticles('answer');
       setStatus('Connected');
+      // Renegotiation answers land here too. Only the transition into a
+      // connected state raced the audio session, so do not rebuild every
+      // speaker's renderer each time somebody joins the channel.
+      const wasConnected = connectionActive;
       setConnectionActive(true);
       channelSelect.disabled = false;
+      if (!wasConnected) scheduleConnectReattach('connected');
       // A mute can outlive a signalling reconnect, so synchronize the new
       // gateway session even when iOS does not emit another mute event.
       if (systemMicrophoneMuted) signal({ type: 'microphone_state', muted: true });
       void requestWakeLock();
       await attemptRenegotiation();
+    } else if (message.type === 'ice_restart') {
+      // libdatachannel gave up on the path while this side still believes it
+      // is connected, so do not wait for a local state change that will not
+      // come.
+      browserLog('gateway reported a lost media path', { reason: message.reason });
+      await restartIce('gateway');
     } else if (message.type === 'renegotiate') {
       browserLog('gateway requested WebRTC renegotiation');
       renegotiationRequested = true;
@@ -668,6 +921,7 @@ function connectSignalling() {
     peer = undefined;
     clearSpeakerArticles();
     currentChannelSessions.clear();
+    cancelConnectReattach();
     console.info(`Wumble signalling WebSocket closed (${code}: ${reason || 'no reason'})`);
     setConnectionActive(false);
     channelSelect.disabled = true;
@@ -696,8 +950,11 @@ form.addEventListener('submit', async (event) => {
     currentChannelSessions.clear();
     window.clearInterval(heartbeat);
     window.clearInterval(statsTimer);
-    stopMicrophone();
-    stopAudioProbe();
+    cancelConnectReattach();
+    // Keep the capture and the audio context across a user-initiated
+    // disconnect. Closing either one destroys the page's audio session, and
+    // the next connect then races its rebuild.
+    suspendMicrophone();
     audioRecoveryNeeded = false;
     setConnectionActive(false);
     channelSelect.disabled = true;

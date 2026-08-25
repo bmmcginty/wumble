@@ -49,6 +49,16 @@ module Wumble
       # offer an audio section for it.
       wire_peer = ->(new_peer : Peer) do
         new_peer.on_opus { |opus, frame_number| mumble.not_nil!.send_opus(opus, frame_number) }
+        # libdatachannel's ICE agent can give up while the browser still
+        # believes the connection is fine, which is how a session ends up
+        # connected and permanently silent. Ask the browser for an ICE restart
+        # instead of waiting for it to notice on its own; the restart offer
+        # arrives on the ordinary "offer" path and keeps Mumble authenticated,
+        # so the speaker's session IDs and tracks survive it.
+        new_peer.on_connection_lost do |detail|
+          STDERR.puts "WebRTC signalling: requesting ICE restart (#{detail})"
+          spawn { send_signal.call({type: "ice_restart", reason: detail}.to_json) }
+        end
         new_peer.on_renegotiation_needed do
           STDERR.puts "WebRTC signalling: requesting renegotiation for new speaker"
           # This can fire from the Mumble UDP voice fiber. Hand the send to a

@@ -39,6 +39,8 @@ lib LibDataChannel
   fun wumble_receiver_start = wumble_receiver_start(pc : Handle) : Int32
   fun wumble_receiver_received = wumble_receiver_received(pc : Handle) : UInt64
   fun wumble_receiver_queued = wumble_receiver_queued(pc : Handle) : UInt64
+  fun wumble_peer_state = wumble_peer_state(pc : Handle) : Int32
+  fun wumble_ice_state = wumble_ice_state(pc : Handle) : Int32
   fun wumble_receiver_stop = wumble_receiver_stop(pc : Handle)
   fun rtc_add_track = rtcAddTrack(pc : Handle, sdp : UInt8*) : Handle
   fun rtc_send_message = rtcSendMessage(track : Handle, data : UInt8*, size : Int32) : Int32
@@ -107,6 +109,12 @@ module Wumble
   end
 
   class Peer
+    # rtcState / rtcIceState values from libdatachannel's rtc.h.
+    PEER_DISCONNECTED =  3
+    PEER_FAILED       =  4
+    ICE_FAILED        =  4
+    ICE_DISCONNECTED  =  5
+
     getter pc : LibDataChannel::Handle
     @tracks = Hash(UInt32, LibDataChannel::Handle).new
     @speaker_tracks = SpeakerTracks.new
@@ -164,6 +172,7 @@ module Wumble
       spawn { receive_browser_audio }
       spawn { log_browser_receiver_debug }
       spawn { log_mumble_voice_batches }
+      spawn { monitor_connection }
     end
 
     def on_opus(&block : Bytes, UInt32 ->)
@@ -175,6 +184,14 @@ module Wumble
     # Mumble UserState arrives, so this fires from the UDP voice fiber too.
     def on_renegotiation_needed(&block : ->)
       @on_renegotiation_needed = block
+    end
+
+    # Invoked when libdatachannel's ICE agent has given up on the media path.
+    # The browser cannot be relied on to notice this itself: its consent checks
+    # can keep reporting "connected" long after libjuice has logged "Lost
+    # connectivity", which leaves the session up, silent and unrecoverable.
+    def on_connection_lost(&block : String ->)
+      @on_connection_lost = block
     end
 
     def speaker_mids : Hash(UInt32, String)
@@ -279,6 +296,30 @@ module Wumble
         LibDataChannel.rtc_delete_peer_connection(@pc)
       end
       @pc = -1
+    end
+
+    # libdatachannel reports connection state only through callbacks on its own
+    # threads, which cannot enter Crystal's runtime, so receiver_bridge latches
+    # the state and this fiber polls the latch. Report the edge into a lost
+    # path once; a recovered path re-arms it so a later loss is reported again.
+    private def monitor_connection
+      lost = false
+      until @closed
+        sleep 1.second
+        break if @closed
+        ice = LibDataChannel.wumble_ice_state(@pc)
+        peer = LibDataChannel.wumble_peer_state(@pc)
+        down = ice == ICE_FAILED || ice == ICE_DISCONNECTED || peer == PEER_FAILED || peer == PEER_DISCONNECTED
+        if down && !lost
+          lost = true
+          detail = "peer_state=#{peer} ice_state=#{ice}"
+          STDERR.puts "WebRTC: media path lost (#{detail})"
+          @on_connection_lost.try &.call(detail)
+        elsif !down && lost
+          lost = false
+          STDERR.puts "WebRTC: media path recovered (peer_state=#{peer} ice_state=#{ice})"
+        end
+      end
     end
 
     # Packets cross the C bridge through a pipe so all parsing and Mumble I/O
