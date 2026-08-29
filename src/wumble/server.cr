@@ -2,6 +2,7 @@ require "http/server"
 require "http/web_socket"
 require "json"
 require "uri"
+require "system/group"
 require "./datachannel"
 require "./mumble"
 
@@ -18,9 +19,23 @@ module Wumble
     def initialize(@web_root : String)
     end
 
-    def run(bind : String, port : Int32)
+    def run(socket_path : String, socket_group : String)
+      remove_stale_socket(socket_path)
       websocket = HTTP::WebSocketHandler.new { |socket, context| puts context.request.path; context.request.path == "/ws" ? handle_socket(socket) : socket.close }
-      HTTP::Server.new([websocket]) { |context| serve(context); nil }.listen(bind, port)
+      server = HTTP::Server.new([websocket]) { |context| serve(context); nil }
+      server.bind_unix(socket_path)
+      group = System::Group.find_by(name: socket_group)
+      File.chown(socket_path, gid: group.id.to_i)
+      File.chmod(socket_path, 0o660)
+      server.listen
+    ensure
+      File.delete?(socket_path) if File.info?(socket_path).try(&.type.socket?)
+    end
+
+    private def remove_stale_socket(socket_path : String)
+      return unless info = File.info?(socket_path, follow_symlinks: false)
+      raise "refusing to replace non-socket at #{socket_path}" unless info.type.socket?
+      File.delete(socket_path)
     end
 
     private def handle_socket(socket : HTTP::WebSocket)

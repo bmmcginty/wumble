@@ -11,10 +11,10 @@ Install Crystal plus the libdatachannel and libopus C libraries and headers thro
 ```sh
 crystal spec
 crystal build src/wumble.cr --release
-./wumble --bind 0.0.0.0 --port 8080
+./wumble
 ```
 
-Open `http://gateway-host:8080/` (serve Wumble behind HTTPS in production for iPhone microphone access, audio autoplay, and secure WebSocket access). Connect sends the captured microphone as a WebRTC Opus stream; Wumble forwards its Opus payloads directly to Mumble without decoding or mixing. The connection fields are saved in the URL fragment when their inputs lose focus; fragments are not sent to the server, but passwords remain visible in browser history and copied links. Mumble connection state and control packet names are written to stderr. Set `WUMBLE_DEBUG=1` to print backtraces and periodic WebRTC diagnostics, including selected ICE addresses, browser receiver callback/pipe/forwarding counts, accepted Opus sample counts, and track send-buffer sizes.
+Wumble listens on `/tmp/wumble.sock`, sets the socket group to `http`, and grants owner/group read-write access (`0660`). Point an HTTPS reverse proxy running as that group at the Unix socket, then open the proxy URL (HTTPS is required in production for iPhone microphone access, audio autoplay, and secure WebSocket access). Use `--socket` or `--group` to override the defaults. Connect sends the captured microphone as a WebRTC Opus stream; Wumble forwards its Opus payloads directly to Mumble without decoding or mixing. The connection fields are saved in the URL fragment when their inputs lose focus; fragments are not sent to the server, but passwords remain visible in browser history and copied links. Mumble connection state and control packet names are written to stderr. Set `WUMBLE_DEBUG=1` to print backtraces and periodic WebRTC diagnostics, including selected ICE addresses, browser receiver callback/pipe/forwarding counts, accepted Opus sample counts, and track send-buffer sizes.
 
 ## Network and deployment
 
