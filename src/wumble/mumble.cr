@@ -109,6 +109,23 @@ module Wumble
       @users.select { |session, _name| @user_channels[session]? == channel }
     end
 
+    # Everyone in your channel except you. You belong in the roster
+    # channel_state sends the browser, but never in the set of speakers bridged
+    # over WebRTC: Mumble never sends your own voice back, so a track for you
+    # can only ever be silent.
+    def speaker_sessions : Array(UInt32)
+      self_session = @session
+      channel_users.keys.reject { |session| session == self_session }
+    end
+
+    # Whether Mumble has placed this session in a channel yet. A speaker can be
+    # heard on the voice fiber before its UserState arrives, and reconciling the
+    # bridged speakers against speaker_sessions would release it again the
+    # moment it was bridged.
+    def known_session?(session : UInt32) : Bool
+      @user_channels.has_key?(session)
+    end
+
     def switch_channel(channel : UInt32)
       raise "unknown Mumble channel #{channel}" unless @channels.has_key?(channel)
       send_packet(USER_STATE, Protobuf.field(5, channel.to_u64))

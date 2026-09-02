@@ -57,6 +57,10 @@ module Wumble
   # free of libdatachannel handles so it can be exercised without opening a peer
   # connection (see spec/speaker_tracks_spec.cr).
   class SpeakerTracks
+    # The browser offers its microphone on mid 0. Peer claims that section with
+    # a track of its own, so it is never handed out to a speaker.
+    MICROPHONE_MID = "0"
+
     getter speakers = Set(UInt32).new
     # session -> mid of the audio section carrying that speaker
     getter mids = Hash(UInt32, String).new
@@ -100,11 +104,10 @@ module Wumble
       end
     end
 
-    # The browser offers its microphone on mid 0 and libdatachannel only answers
-    # sections it can pair with a local track, so mid 0 must always be claimed.
     private def available_mid : String?
-      return "0" if @payload_types.has_key?("0") && !@mids.values.includes?("0")
-      @payload_types.keys.find { |candidate| !@mids.values.includes?(candidate) }
+      @payload_types.keys.find do |candidate|
+        candidate != MICROPHONE_MID && !@mids.values.includes?(candidate)
+      end
     end
   end
 
@@ -115,8 +118,14 @@ module Wumble
     ICE_FAILED        =  4
     ICE_DISCONNECTED  =  5
 
+    # An SSRC for the microphone section that no Mumble session can collide
+    # with. Murmur hands out session IDs from 1 upwards, so a low constant here
+    # would eventually name a real speaker as well.
+    MICROPHONE_SSRC = 0xC0FFEE_u32
+
     getter pc : LibDataChannel::Handle
     @tracks = Hash(UInt32, LibDataChannel::Handle).new
+    @microphone_track : LibDataChannel::Handle? = nil
     @speaker_tracks = SpeakerTracks.new
     @dropped_packets = Hash(UInt32, UInt64).new(0_u64)
     @sent_packets = Hash(UInt32, UInt64).new(0_u64)
@@ -205,6 +214,7 @@ module Wumble
       @mid_extension_ids = mid_extension_ids(sdp)
       result = LibDataChannel.rtc_set_remote_description(@pc, sdp.to_unsafe, "offer".to_unsafe)
       raise "rtcSetRemoteDescription failed (#{result})" if result < 0
+      add_microphone_track(payload_types)
       needs_renegotiation = @speaker_tracks.accept_offer(payload_types) { |session, mid| add_speaker_track(session, mid) }
       # Only now, with every speaker this offer made room for bridged, does the
       # answer describe all of them. Automatic negotiation is disabled so that
@@ -511,8 +521,6 @@ module Wumble
     # the next speaker. This is reachable from the Mumble UDP voice fiber, so it
     # reports failure rather than raising.
     private def add_speaker_track(session : UInt32, mid : String) : Bool
-      # A stable, per-speaker SSRC lets the browser expose each voice as an
-      # independent MediaStreamTrack.
       # RTP payload types are scoped to the offer. Chrome generally offers
       # Opus as 111, while Firefox commonly uses 109; answering with a new
       # payload type makes Firefox discard otherwise valid SRTP packets.
@@ -521,22 +529,10 @@ module Wumble
         STDERR.puts "WebRTC: offer has no Opus payload type for audio mid #{mid}; skipping session=#{session}"
         return false
       end
-      # The browser offers its microphone on m=0. Make that paired track
-      # sendrecv so the answer authorizes browser-to-gateway RTP as well as
-      # gateway-to-browser speaker audio; the remaining speaker tracks are
-      # receive-only in the browser and stay sendonly here.
-      direction = mid == "0" ? "sendrecv" : "sendonly"
-      # forward_opus stamps every packet with the MID header extension, so
-      # answer with the extension the offer assigned to this section. Without
-      # it the browser has only the SSRC to route BUNDLE'd audio by, which
-      # leaves a speaker silent whenever that mapping is not in place yet.
-      extmap = if extension_id = @mid_extension_ids[mid]?
-                 "a=extmap:#{extension_id} urn:ietf:params:rtp-hdrext:sdes:mid\r\n"
-               else
-                 ""
-               end
-      sdp = "m=audio 9 UDP/TLS/RTP/SAVPF #{payload_type}\r\na=mid:#{mid}\r\na=#{direction}\r\n#{extmap}a=rtpmap:#{payload_type} opus/48000/2\r\na=fmtp:#{payload_type} minptime=10;useinbandfec=1\r\na=ssrc:#{session} cname:wumble-#{session}\r\n"
-      track = LibDataChannel.rtc_add_track(@pc, sdp.to_unsafe)
+      # Speaker sections are receive-only in the browser, so they are sendonly
+      # here. A stable, per-speaker SSRC lets the browser expose each voice as
+      # an independent MediaStreamTrack.
+      track = LibDataChannel.rtc_add_track(@pc, audio_section(mid, payload_type, "sendonly", session, "wumble-#{session}").to_unsafe)
       if track < 0
         STDERR.puts "WebRTC: rtcAddTrack failed (#{track}) for session=#{session} mid=#{mid}"
         return false
@@ -544,6 +540,47 @@ module Wumble
       STDERR.puts "WebRTC: added Opus track session=#{session} mid=#{mid} track=#{track} ssrc=#{session} payload_type=#{payload_type} mid_extension=#{@mid_extension_ids[mid]?}" if debug?
       @tracks[session] = track
       true
+    end
+
+    # The browser offers its microphone on mid 0, and libdatachannel only
+    # answers a section it can pair with a local track: an unpaired section is
+    # answered inactive and the browser stops sending. mid 0 therefore has to be
+    # claimed, and it is claimed here rather than by whichever Mumble speaker
+    # happened to sort first. That speaker was reliably the gateway's own
+    # session, which put a permanently silent copy of you in your own speaker
+    # list -- Mumble never sends your voice back to you -- and left the
+    # microphone's authorization resting on roster order.
+    private def add_microphone_track(payload_types : Hash(String, UInt8)) : Nil
+      return if @microphone_track
+      mid = SpeakerTracks::MICROPHONE_MID
+      payload_type = payload_types[mid]?
+      unless payload_type
+        STDERR.puts "WebRTC: offer has no Opus payload type for microphone mid #{mid}; the browser cannot be heard"
+        return
+      end
+      # sendrecv, not recvonly: the answer has to authorize browser-to-gateway
+      # RTP, and libdatachannel pairs the section with a local sender either
+      # way. Nothing is ever sent on it, so its SSRC never appears on the wire.
+      track = LibDataChannel.rtc_add_track(@pc, audio_section(mid, payload_type, "sendrecv", MICROPHONE_SSRC, "wumble-microphone").to_unsafe)
+      if track < 0
+        STDERR.puts "WebRTC: rtcAddTrack failed (#{track}) for microphone mid #{mid}"
+        return
+      end
+      STDERR.puts "WebRTC: claimed microphone mid=#{mid} track=#{track} payload_type=#{payload_type}" if debug?
+      @microphone_track = track
+    end
+
+    # forward_opus stamps every packet with the MID header extension, so answer
+    # with the extension the offer assigned to this section. Without it the
+    # browser has only the SSRC to route BUNDLE'd audio by, which leaves a
+    # speaker silent whenever that mapping is not in place yet.
+    private def audio_section(mid : String, payload_type : UInt8, direction : String, ssrc : UInt32, cname : String) : String
+      extmap = if extension_id = @mid_extension_ids[mid]?
+                 "a=extmap:#{extension_id} urn:ietf:params:rtp-hdrext:sdes:mid\r\n"
+               else
+                 ""
+               end
+      "m=audio 9 UDP/TLS/RTP/SAVPF #{payload_type}\r\na=mid:#{mid}\r\na=#{direction}\r\n#{extmap}a=rtpmap:#{payload_type} opus/48000/2\r\na=fmtp:#{payload_type} minptime=10;useinbandfec=1\r\na=ssrc:#{ssrc} cname:#{cname}\r\n"
     end
 
     private def mid_extension_ids(sdp : String) : Hash(String, UInt8)

@@ -30,7 +30,13 @@ describe Wumble::Peer do
     peer = Wumble::Peer.new
     begin
       peer.request_speaker(41_u32)
-      peer.accept_offer(browser_offer(0)).should be_false
+      # mid 0 belongs to the browser's microphone, so an offer carrying only
+      # that section bridges nobody and has to ask for another.
+      peer.accept_offer(browser_offer(0)).should be_true
+      peer.speaker_mids.should be_empty
+      peer.local_description.not_nil!.should contain("a=ssrc:#{Wumble::Peer::MICROPHONE_SSRC} cname:wumble-microphone")
+
+      peer.accept_offer(browser_offer(0, 1)).should be_false
       first_answer = peer.local_description.not_nil!
       first_answer.should contain("a=ssrc:41 cname:wumble-41")
 
@@ -40,9 +46,9 @@ describe Wumble::Peer do
       peer.request_speaker(42_u32)
       requested.should be_true
 
-      peer.accept_offer(browser_offer(0, 1)).should be_false
+      peer.accept_offer(browser_offer(0, 1, 2)).should be_false
       answer = peer.local_description.not_nil!
-      peer.speaker_mids.should eq({41_u32 => "0", 42_u32 => "1"})
+      peer.speaker_mids.should eq({41_u32 => "1", 42_u32 => "2"})
       answer.should contain("a=ssrc:41 cname:wumble-41")
       answer.should contain("a=ssrc:42 cname:wumble-42")
     ensure
@@ -56,7 +62,8 @@ describe Wumble::Peer do
     peer = Wumble::Peer.new
     begin
       peer.request_speaker(41_u32)
-      peer.accept_offer(browser_offer(0))
+      peer.accept_offer(browser_offer(0, 1))
+      peer.speaker_mids.should eq({41_u32 => "1"})
       peer.local_description.not_nil!.should contain("a=extmap:5 urn:ietf:params:rtp-hdrext:sdes:mid")
     ensure
       peer.close

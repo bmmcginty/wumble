@@ -780,10 +780,11 @@ async function makeOffer(speakerCount = 1) {
   clearSpeakerArticles();
   const currentPeer = new RTCPeerConnection({ iceServers: [] });
   peer = currentPeer;
-  // Use the first speaker m= section in both directions. libdatachannel only
-  // answers the offered sections it can pair with a local track; a separate
-  // microphone section would therefore be rejected as inactive. The two
-  // directions still retain independent RTP streams and Opus packets.
+  // The microphone goes on mid 0, in both directions: libdatachannel only
+  // answers the offered sections it can pair with a local track, so the gateway
+  // claims this one with a track of its own rather than leaving it unpaired and
+  // answered inactive. Nothing is ever sent on the gateway's half, and the two
+  // directions retain independent RTP streams and Opus packets regardless.
   peer.addTransceiver(microphoneStream.getAudioTracks()[0], { direction: 'sendrecv' });
   // Offer more receive-only sections than there are speakers. A Mumble user
   // who joins later can then be given a track straight away instead of the
@@ -792,7 +793,8 @@ async function makeOffer(speakerCount = 1) {
   // silent" bug has come out of. Renegotiation still happens, to publish the
   // new section's SSRC, but it can no longer fail to find a section at all.
   // Idle sections cost nothing but a few lines of SDP.
-  const sections = Math.max(1, speakerCount) + SPARE_SPEAKER_SECTIONS;
+  // One for the microphone, one per speaker the gateway already knows about.
+  const sections = 1 + Math.max(0, speakerCount) + SPARE_SPEAKER_SECTIONS;
   for (let index = 1; index < sections; index += 1) {
     peer.addTransceiver('audio', { direction: 'recvonly' });
   }

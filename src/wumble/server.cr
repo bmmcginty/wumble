@@ -141,8 +141,8 @@ module Wumble
               # already-connected browser is offered a track for every
               # newcomer. On a fresh Peer these only populate the roster: no
               # offer has been accepted yet, so restart_webrtc drives that.
-              connection.channel_users.each_key { |speaker| peer.not_nil!.request_speaker(speaker) }
-              send_signal.call({type: "restart_webrtc", speakers: connection.channel_users.size}.to_json) if switched
+              connection.speaker_sessions.each { |speaker| peer.not_nil!.request_speaker(speaker) }
+              send_signal.call({type: "restart_webrtc", speakers: connection.speaker_sessions.size}.to_json) if switched
               active_channel = channel if channel
             end
             mumble.not_nil!.on_voice { |speaker, opus, frame_number| peer.not_nil!.send_opus(speaker, opus, frame_number) }
@@ -152,16 +152,16 @@ module Wumble
             # head-of-line blocking causes the latency this gateway avoids.
             mumble.not_nil!.on_ready do
               connection = mumble.not_nil!
-              connection.channel_users.each_key { |speaker| peer.not_nil!.request_speaker(speaker) }
+              connection.speaker_sessions.each { |speaker| peer.not_nil!.request_speaker(speaker) }
               if connection.udp_available
-                send_signal.call({type: "connected", speakers: connection.channel_users.size}.to_json)
+                send_signal.call({type: "connected", speakers: connection.speaker_sessions.size}.to_json)
               end
             end
             mumble.not_nil!.on_udp_available do
               connection = mumble.not_nil!
-              connection.channel_users.each_key { |speaker| peer.not_nil!.request_speaker(speaker) }
+              connection.speaker_sessions.each { |speaker| peer.not_nil!.request_speaker(speaker) }
               if connection.synchronized
-                send_signal.call({type: "connected", speakers: connection.channel_users.size}.to_json)
+                send_signal.call({type: "connected", speakers: connection.speaker_sessions.size}.to_json)
               end
             end
             mumble.not_nil!.on_udp_unavailable do
