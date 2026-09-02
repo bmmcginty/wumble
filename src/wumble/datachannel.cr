@@ -136,6 +136,7 @@ module Wumble
     getter pc : LibDataChannel::Handle
     @tracks = Hash(UInt32, LibDataChannel::Handle).new
     @microphone_track : LibDataChannel::Handle? = nil
+    @released_speakers = Set(UInt32).new
     @speaker_tracks = SpeakerTracks.new
     @dropped_packets = Hash(UInt32, UInt64).new(0_u64)
     @sent_packets = Hash(UInt32, UInt64).new(0_u64)
@@ -217,24 +218,18 @@ module Wumble
       @speaker_tracks.mids
     end
 
-    # Every speaker this Peer is bridging or still owes a section to, so a
-    # caller can reconcile them against the Mumble roster.
-    def bridged_speakers : Array(UInt32)
-      @speaker_tracks.speakers.to_a
-    end
-
-    # A speaker who has left your channel. Free the audio section they held so
-    # the next arrival reuses it, and drop their per-session state. Without this
-    # the browser has to offer a fresh m= section for every user who has ever
-    # been in the channel with you, and a friend whose client reconnects a few
-    # times costs one apiece.
-    #
-    # The libdatachannel track is deliberately not deleted. rtcAddTrack is keyed
-    # by mid and replaces that section's description in place, so reclaiming the
-    # mid for the next speaker republishes it with their SSRC; deleting the
-    # track first would only risk the section libdatachannel is still answering.
+    # A speaker Mumble has removed. Free the audio section they held so the next
+    # arrival reuses it, retire that section, and drop their per-session state.
+    # Without this the browser has to offer a fresh m= section for every user
+    # who has ever been in the channel with you, and a friend whose client
+    # reconnects a few times costs one apiece.
     def release_speaker(session : UInt32) : Nil
       mid = @speaker_tracks.remove(session)
+      # Murmur never reissues a session ID, so a released speaker can only come
+      # back through a voice packet that was already in flight when they left.
+      # Without this they would reclaim the section that was just freed and
+      # never be reconciled away again: there is no second UserRemove.
+      @released_speakers << session
       @tracks.delete(session)
       @dropped_packets.delete(session)
       @sent_packets.delete(session)
@@ -244,7 +239,12 @@ module Wumble
       @first_packet.delete(session)
       @next_mumble_frame.delete(session)
       @mumble_packet_frames.delete(session)
-      STDERR.puts "WebRTC: released speaker session=#{session} mid=#{mid || "none"}" if debug?
+      return unless mid
+      STDERR.puts "WebRTC: released speaker session=#{session} mid=#{mid}" if debug?
+      retire_section(mid)
+      # The browser is still holding an answer that describes this section as
+      # the departed speaker's. Ask for the offer that lets us replace it.
+      @on_renegotiation_needed.try &.call
     end
 
     # Returns true when additional known speakers still need another offered
@@ -278,6 +278,7 @@ module Wumble
     # request would latch that flag with no offer ever arriving to clear it,
     # starving every later speaker of a track for the life of this Peer.
     def request_speaker(session : UInt32) : Nil
+      return if @released_speakers.includes?(session)
       added = false
       needed = @speaker_tracks.add(session) do |speaker, mid|
         created = add_speaker_track(speaker, mid)
@@ -610,17 +611,44 @@ module Wumble
       @microphone_track = track
     end
 
+    # A section whose speaker has left. rtcAddTrack is keyed by mid and rewrites
+    # that section's description in place, so answering it inactive drops the
+    # departed speaker's SSRC and tells the browser to tear its receiver down;
+    # reclaiming the mid later restores it as sendonly with the new speaker's.
+    #
+    # rtcDeleteTrack is deliberately not used, even though it is the obvious
+    # call here. Every handle rtcAddTrack hands back for one mid aliases a
+    # single underlying track, so deleting any of them destroys the section for
+    # good: it stays inactive, and a later rtcAddTrack for that mid is accepted
+    # and then ignored, which would leave the next speaker to claim it silent.
+    # spec/peer_answer_spec.cr pins the working half of this. The price is one
+    # leaked track handle per section retired or reclaimed, which this peer
+    # connection only pays once per membership change and gives back when it
+    # closes.
+    private def retire_section(mid : String) : Nil
+      payload_type = @speaker_tracks.payload_types[mid]?
+      return unless payload_type
+      track = LibDataChannel.rtc_add_track(@pc, audio_section(mid, payload_type, "inactive").to_unsafe)
+      if track < 0
+        STDERR.puts "WebRTC: rtcAddTrack failed (#{track}) retiring audio mid #{mid}"
+        return
+      end
+      STDERR.puts "WebRTC: retired audio mid=#{mid} track=#{track}" if debug?
+    end
+
     # forward_opus stamps every packet with the MID header extension, so answer
     # with the extension the offer assigned to this section. Without it the
     # browser has only the SSRC to route BUNDLE'd audio by, which leaves a
     # speaker silent whenever that mapping is not in place yet.
-    private def audio_section(mid : String, payload_type : UInt8, direction : String, ssrc : UInt32, cname : String) : String
+    private def audio_section(mid : String, payload_type : UInt8, direction : String, ssrc : UInt32? = nil, cname : String? = nil) : String
       extmap = if extension_id = @mid_extension_ids[mid]?
                  "a=extmap:#{extension_id} urn:ietf:params:rtp-hdrext:sdes:mid\r\n"
                else
                  ""
                end
-      "m=audio 9 UDP/TLS/RTP/SAVPF #{payload_type}\r\na=mid:#{mid}\r\na=#{direction}\r\n#{extmap}a=rtpmap:#{payload_type} opus/48000/2\r\na=fmtp:#{payload_type} minptime=10;useinbandfec=1\r\na=ssrc:#{ssrc} cname:#{cname}\r\n"
+      # An inactive section carries no stream, so it names no SSRC.
+      ssrc_line = ssrc && cname ? "a=ssrc:#{ssrc} cname:#{cname}\r\n" : ""
+      "m=audio 9 UDP/TLS/RTP/SAVPF #{payload_type}\r\na=mid:#{mid}\r\na=#{direction}\r\n#{extmap}a=rtpmap:#{payload_type} opus/48000/2\r\na=fmtp:#{payload_type} minptime=10;useinbandfec=1\r\n#{ssrc_line}"
     end
 
     private def mid_extension_ids(sdp : String) : Hash(String, UInt8)

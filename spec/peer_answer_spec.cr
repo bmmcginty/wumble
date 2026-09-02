@@ -21,6 +21,12 @@ private def browser_offer(*mids : Int32) : String
   end
 end
 
+# libdatachannel reorders the attributes it answers with, so assert on one m=
+# section at a time rather than on adjacent lines.
+private def section(sdp : String, mid : String) : String
+  sdp.split(/^m=/m).find(&.includes?("a=mid:#{mid}\r\n")) || ""
+end
+
 describe Wumble::Peer do
   # A speaker whose section is answered without "a=ssrc:" leaves the browser no
   # way to route that speaker's RTP: it receives the packets and discards them
@@ -59,15 +65,21 @@ describe Wumble::Peer do
   # A user who leaves must give their m= section back. Without this the browser
   # has to offer a fresh section for everyone who has ever been in the channel,
   # so a friend whose client reconnects a few times costs one apiece.
-  it "reuses a departed speaker's section for the next speaker" do
+  it "retires a departed speaker's section and reuses it for the next" do
     peer = Wumble::Peer.new
     begin
       peer.request_speaker(41_u32)
       peer.accept_offer(browser_offer(0, 1))
       peer.speaker_mids.should eq({41_u32 => "1"})
 
+      # Releasing retires the section: inactive, and naming nobody's SSRC, so
+      # the browser tears its receiver down instead of waiting on a stream that
+      # will never arrive.
       peer.release_speaker(41_u32)
-      peer.bridged_speakers.should be_empty
+      peer.accept_offer(browser_offer(0, 1)).should be_false
+      retired = section(peer.local_description.not_nil!, "1")
+      retired.should contain("a=inactive")
+      retired.should_not contain("a=ssrc:")
 
       # The same offer, with no new section in it, now covers the newcomer.
       peer.request_speaker(42_u32)
@@ -75,11 +87,34 @@ describe Wumble::Peer do
       peer.speaker_mids.should eq({42_u32 => "1"})
 
       # One section per mid, republished with the new speaker's SSRC and
-      # nothing left over from the old one.
+      # nothing left over from the old one. This is what rtcDeleteTrack breaks:
+      # it destroys the mid's one underlying track, and the section then stays
+      # inactive no matter how many times it is re-added.
       answer = peer.local_description.not_nil!
       answer.scan(/^a=mid:1\r?$/m).size.should eq(1)
-      answer.should contain("a=ssrc:42 cname:wumble-42")
-      answer.should_not contain("a=ssrc:41 cname:wumble-41")
+      reclaimed = section(answer, "1")
+      reclaimed.should contain("a=sendonly")
+      reclaimed.should contain("a=ssrc:42 cname:wumble-42")
+      reclaimed.should_not contain("a=ssrc:41 cname:wumble-41")
+    ensure
+      peer.close
+    end
+  end
+
+  # Murmur never reissues a session ID, so the only way a released speaker comes
+  # back is a voice packet that was already in flight. It must not reclaim the
+  # section that was just freed: there is no second UserRemove to release it.
+  it "does not re-bridge a released speaker" do
+    peer = Wumble::Peer.new
+    begin
+      peer.request_speaker(41_u32)
+      peer.accept_offer(browser_offer(0, 1))
+      peer.release_speaker(41_u32)
+
+      peer.request_speaker(41_u32)
+      peer.accept_offer(browser_offer(0, 1))
+      peer.speaker_mids.should be_empty
+      section(peer.local_description.not_nil!, "1").should contain("a=inactive")
     ensure
       peer.close
     end

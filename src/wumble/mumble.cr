@@ -62,6 +62,7 @@ module Wumble
     getter on_udp_available : Proc(Nil)?
     getter on_udp_unavailable : Proc(Nil)?
     getter on_disconnect : Proc(String, Bool, Nil)?
+    getter on_user_removed : Proc(UInt32, Nil)?
     getter synchronized = false
     getter udp_available = false
 
@@ -91,6 +92,15 @@ module Wumble
       @on_user = block
     end
 
+    # Someone other than you has left the server. This is deliberately an event
+    # rather than a diff against speaker_sessions: voice reaches the gateway for
+    # users outside your channel too -- a whisper or a shout -- and a speaker
+    # bridged by their own voice packets would be released and re-bridged on
+    # every roster update if membership alone decided who belongs.
+    def on_user_removed(&block : UInt32 ->)
+      @on_user_removed = block
+    end
+
     def on_ready(&block : ->)
       @on_ready = block
     end
@@ -116,14 +126,6 @@ module Wumble
     def speaker_sessions : Array(UInt32)
       self_session = @session
       channel_users.keys.reject { |session| session == self_session }
-    end
-
-    # Whether Mumble has placed this session in a channel yet. A speaker can be
-    # heard on the voice fiber before its UserState arrives, and reconciling the
-    # bridged speakers against speaker_sessions would release it again the
-    # moment it was bridged.
-    def known_session?(session : UInt32) : Bool
-      @user_channels.has_key?(session)
     end
 
     def switch_channel(channel : UInt32)
@@ -358,6 +360,7 @@ module Wumble
       if removed_session
         @users.delete(removed_session.not_nil!)
         @user_channels.delete(removed_session.not_nil!)
+        @on_user_removed.try &.call(removed_session.not_nil!) unless removed_session == @session
         @on_state.try &.call
       end
       return unless removed_session && removed_session == @session

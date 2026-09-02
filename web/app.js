@@ -23,11 +23,11 @@ const currentChannelSessions = new Set();
 // Element -> the remote track it plays. The track is kept because reattaching
 // after an interruption has to build a new MediaStream around the same track.
 const speakerAudio = new Map();
-// mid -> the remote track and stream ontrack delivered for that m= section.
-// Offered sections outnumber speakers (see SPARE_SPEAKER_SECTIONS), so a
-// section can receive its track long before the gateway assigns a speaker to
-// it. ontrack fires once per section and never again, so the track has to be
-// held here until there is a speaker to build an element for.
+// mid -> the remote track ontrack delivered for that m= section. Offered
+// sections outnumber speakers (see SPARE_SPEAKER_SECTIONS), so a section can
+// receive its track long before the gateway assigns a speaker to it. ontrack
+// fires once per section and never again, so the track has to be held here
+// until there is a speaker to build an element for.
 const remoteTracksByMid = new Map();
 const SPARE_SPEAKER_SECTIONS = 6;
 let playbackResumeRunning = false;
@@ -392,7 +392,7 @@ function labelSpeakerArticle(article, speaker) {
   }
 }
 
-function createSpeakerArticle(mid, { track, stream }, speaker, reason) {
+function createSpeakerArticle(mid, track, speaker, reason) {
   const label = `${speaker.name} (session ${speaker.session})`;
   browserLog('building speaker element', { mid, session: speaker.session, reason });
   const container = document.createElement('article');
@@ -402,7 +402,10 @@ function createSpeakerArticle(mid, { track, stream }, speaker, reason) {
   audio.autoplay = true;
   audio.controls = true;
   audio.title = label;
-  audio.srcObject = stream;
+  // Always a fresh MediaStream, never the one ontrack delivered: the gateway
+  // answers a departed speaker's section inactive, which takes the track out of
+  // that stream, and the section can be reclaimed by somebody else later.
+  audio.srcObject = new MediaStream([track]);
   audio.dataset.trackId = track.id;
   audio.dataset.session = String(speaker.session);
   const volume = document.createElement('input');
@@ -449,7 +452,7 @@ function createSpeakerArticle(mid, { track, stream }, speaker, reason) {
 function syncSpeakerArticles(reason) {
   const existingByMid = new Map();
   for (const article of speakers.querySelectorAll('article')) existingByMid.set(article.dataset.mid, article);
-  for (const [mid, entry] of remoteTracksByMid) {
+  for (const [mid, track] of remoteTracksByMid) {
     const speaker = speakerInfoByMid.get(mid);
     // A spare section the gateway has not assigned to anybody yet.
     if (!speaker) continue;
@@ -458,7 +461,7 @@ function syncSpeakerArticles(reason) {
     if (currentChannelSessions.size && !currentChannelSessions.has(String(speaker.session))) continue;
     const existing = existingByMid.get(mid);
     if (existing) labelSpeakerArticle(existing, speaker);
-    else createSpeakerArticle(mid, entry, speaker, reason);
+    else createSpeakerArticle(mid, track, speaker, reason);
   }
 }
 
@@ -842,7 +845,7 @@ async function makeOffer(speakerCount = 1) {
     browserLog('received remote track', { id: track.id, kind: track.kind, streams: streams.length, mid, speaker: speakerInfoByMid.get(mid) ?? null });
     // Do not combine tracks into one MediaStream. One received track means one
     // Mumble speaker and gets its own audio element and jitter buffer.
-    remoteTracksByMid.set(mid, { track, stream: streams[0] || new MediaStream([track]) });
+    remoteTracksByMid.set(mid, track);
     track.onended = () => {
       browserLog('remote track ended', { id: track.id, mid });
       remoteTracksByMid.delete(mid);
