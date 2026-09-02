@@ -41,10 +41,15 @@ module Wumble
     REJECT        =  4
     SERVER_SYNC   =  5
     CHANNEL_STATE =  7
-    USER_STATE    =  9
-    USER_REMOVE   = 12
-    CRYPT_SETUP   = 15
-    CODEC_VERSION = 21
+    # Mumble.proto numbers UserRemove 8 and UserState 9. UserRemove was 12 --
+    # PermissionDenied -- for long enough to be worth naming here: departures
+    # were then never processed, so @users kept every stale session and a
+    # rejoining user appeared once per session they had ever held.
+    USER_REMOVE       =  8
+    USER_STATE        =  9
+    PERMISSION_DENIED = 12
+    CRYPT_SETUP       = 15
+    CODEC_VERSION     = 21
 
     getter users = Hash(UInt32, String).new
     getter channels = Hash(UInt32, String).new
@@ -493,6 +498,7 @@ module Wumble
       when CHANNEL_STATE then "ChannelState"
       when USER_STATE    then "UserState"
       when USER_REMOVE   then "UserRemove"
+      when PERMISSION_DENIED then "PermissionDenied"
       when CRYPT_SETUP   then "CryptSetup"
       when CODEC_VERSION then "CodecVersion"
       when 24            then "ServerConfig"

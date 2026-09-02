@@ -186,26 +186,30 @@ function playWithTimeout(audio) {
 // energy -- while nothing reaches the speaker, and no element event fires.
 // Pointing each element at a fresh MediaStream over the same track is the only
 // way from script to make Safari build a new renderer for it.
+async function reattachSpeakerElement(audio, reason) {
+  const track = speakerAudio.get(audio);
+  if (!track) return;
+  try {
+    audio.srcObject = null;
+    audio.srcObject = new MediaStream([track]);
+    // iOS can return a play() promise that never settles while it still holds
+    // the audio session. Awaiting it unbounded would stall the caller's loop
+    // and leave every later speaker un-reattached.
+    await playWithTimeout(audio);
+  } catch (error) {
+    browserLog('speaker reattach failed', {
+      reason,
+      session: audio.dataset.session || null,
+      message: String(error),
+      name: error.name,
+    });
+  }
+}
+
 async function reattachSpeakerAudio(reason) {
   if (!speakerAudio.size) return;
   browserLog('reattaching speaker audio', { reason, speakers: speakerAudio.size });
-  for (const [audio, track] of speakerAudio) {
-    try {
-      audio.srcObject = null;
-      audio.srcObject = new MediaStream([track]);
-      // iOS can return a play() promise that never settles while it still holds
-      // the audio session. Awaiting it unbounded would stall this loop and
-      // leave every later speaker un-reattached.
-      await playWithTimeout(audio);
-    } catch (error) {
-      browserLog('speaker reattach failed', {
-        reason,
-        session: audio.dataset.session || null,
-        message: String(error),
-        name: error.name,
-      });
-    }
-  }
+  for (const audio of [...speakerAudio.keys()]) await reattachSpeakerElement(audio, reason);
 }
 
 // A connect binds new audio elements while iOS may still be rebuilding the
@@ -231,6 +235,33 @@ function scheduleConnectReattach(reason) {
       void reattachSpeakerAudio(reason);
     }, delay));
   }
+}
+
+// A speaker who joins after connect gets an element built in exactly the state
+// described above, and nothing covers it: scheduleConnectReattach has already
+// run and will not run again, and resumeSpeakerPlayback is a no-op because the
+// new element is not paused. It reports playing, its inbound-rtp carries real
+// audio energy, and it stays silent until the page is reloaded. Give the new
+// element the same double rebuild the connect path gives all of them, one
+// element at a time so an already-audible speaker is never interrupted.
+const speakerReattachTimers = new Map();
+function cancelSpeakerReattach(audio) {
+  for (const timer of speakerReattachTimers.get(audio) || []) window.clearTimeout(timer);
+  speakerReattachTimers.delete(audio);
+}
+
+function scheduleSpeakerReattach(audio, reason) {
+  cancelSpeakerReattach(audio);
+  const timers = [];
+  for (const delay of [250, 1_500]) {
+    timers.push(window.setTimeout(() => {
+      // The element may have been removed with its speaker in the meantime.
+      if (!connectionActive || !speakerAudio.has(audio)) return;
+      browserLog('reattaching new speaker', { reason, session: audio.dataset.session || null, delay });
+      void reattachSpeakerElement(audio, reason);
+    }, delay));
+  }
+  speakerReattachTimers.set(audio, timers);
 }
 
 // Rebuild what the interruption tore down, in dependency order: the audio
@@ -334,12 +365,16 @@ function stopAudioProbe() {
 }
 
 function removeSpeakerArticle(article) {
-  for (const audio of article.querySelectorAll('audio')) speakerAudio.delete(audio);
+  for (const audio of article.querySelectorAll('audio')) {
+    cancelSpeakerReattach(audio);
+    speakerAudio.delete(audio);
+  }
   article.remove();
 }
 
 function clearSpeakerArticles() {
   speakers.replaceChildren();
+  for (const audio of speakerAudio.keys()) cancelSpeakerReattach(audio);
   speakerAudio.clear();
   speakerInfoByMid.clear();
   remoteTracksByMid.clear();
@@ -402,6 +437,9 @@ function createSpeakerArticle(mid, { track, stream }, speaker, reason) {
   // autoplay, so ask for playback explicitly rather than trusting the
   // autoplay attribute.
   void resumeSpeakerPlayback('speaker element added');
+  // ...and an element that does start playing can still be rendering into
+  // nothing, which only a rebuild repairs.
+  scheduleSpeakerReattach(audio, 'speaker element added');
 }
 
 // One article per assigned m= section. This runs both when a track arrives and
