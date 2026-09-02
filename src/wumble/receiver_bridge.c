@@ -140,6 +140,18 @@ static void on_track(int pc, int track, void *ptr) {
     }
 }
 
+/*
+ * The gateway offers, so the section carrying the browser's microphone is a
+ * track it adds itself. on_track only fires for tracks a remote description
+ * creates, so route this one to the same pipe explicitly.
+ */
+int wumble_receiver_attach(int pc, int track) {
+    wumble_receiver *receiver = rtcGetUserPointer(pc);
+    if (!receiver) return -1;
+    rtcSetUserPointer(track, receiver);
+    return rtcSetMessageCallback(track, on_message);
+}
+
 int wumble_receiver_start(int pc) {
     wumble_receiver *receiver = calloc(1, sizeof(*receiver));
     if (!receiver) return -1;

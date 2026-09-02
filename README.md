@@ -2,7 +2,9 @@
 
 Wumble is a Crystal server that bridges a Mumble connection to a browser through WebRTC using libdatachannel. The browser page is deliberately small, custom JavaScript.
 
-Every Mumble Opus voice packet is put into an RTP packet and sent on the WebRTC audio track assigned to its Mumble session ID. Wumble never decodes, mixes, or combines speaker audio. A browser receives an independent `MediaStreamTrack` (and audio element) for each speaker. When a Mumble user joins after connection, Wumble renegotiates WebRTC to add that speaker's audio section.
+Every Mumble Opus voice packet is put into an RTP packet and sent on the WebRTC audio section currently assigned to its Mumble session. Wumble never decodes, mixes, or combines speaker audio. A browser receives an independent `MediaStreamTrack` (and audio element) for each speaker.
+
+Wumble is the side that offers; the browser only ever answers, and never adds a media section of its own. `m=audio` section 0 carries the browser's microphone. The rest are created one at a time, as speakers arrive, and are never pre-allocated. Their SSRCs belong to the sections rather than to the speakers, so a section left behind by someone who leaves is handed to the next arrival over the signalling socket, with no SDP change at all. Renegotiation therefore happens only when more people are in the channel at once than ever before, and the number of sections settles at that high-water mark -- WebRTC cannot remove an `m=` line from a session, so reusing them is what bounds the count.
 
 ## Prerequisites
 

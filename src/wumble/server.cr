@@ -42,14 +42,12 @@ module Wumble
       STDERR.puts "WebRTC signalling: WebSocket opened"
       peer = nil.as(Peer?)
       mumble = nil.as(MumbleConnection?)
-      active_channel = nil.as(UInt32?)
       mic_state_events = Channel(Bool).new(8)
-      # Signalling is now emitted from the Mumble TCP fiber (on_state), the
-      # Mumble UDP voice fiber (a speaker heard before its UserState) and the
-      # answer fiber. Serialize the frames so they cannot interleave, and
-      # swallow send errors: an exception raised inside a Mumble callback
-      # unwinds that connection's read loop and is reported as a Mumble
-      # disconnect.
+      # Signalling is emitted from the Mumble TCP fiber (on_state), from the
+      # media-path monitor and from this socket's own message handler.
+      # Serialize the frames so they cannot interleave, and swallow send
+      # errors: an exception raised inside a Mumble callback unwinds that
+      # connection's read loop and is reported as a Mumble disconnect.
       send_lock = Mutex.new
       send_signal = ->(payload : String) do
         send_lock.synchronize do
@@ -58,30 +56,60 @@ module Wumble
           STDERR.puts "WebRTC signalling: send failed: #{ex.message || ex.class.name}"
         end
       end
-      # Every Peer, including the one rebuilt on a channel switch, needs the
-      # same wiring. on_renegotiation_needed is what breaks the deadlock: a
-      # speaker first heard on the voice fiber must still get the browser to
-      # offer an audio section for it.
+      # Name every assigned section for the browser. This is what tells it
+      # which audio element is whom, and it is ordinary signalling data: the
+      # SSRCs belong to the sections, so a speaker changing places needs this
+      # message and nothing else.
+      sections_of = ->(current : Peer, connection : MumbleConnection) do
+        current.assignments.map do |assignment|
+          {
+            mid:     assignment[:mid],
+            ssrc:    assignment[:ssrc],
+            session: assignment[:session],
+            name:    connection.users[assignment[:session]]? || "Session #{assignment[:session]}",
+          }
+        end
+      end
+      # Publish whatever set_speakers decided. An offer carries the mapping
+      # too, so the browser is never left holding a section it cannot name.
+      # Peer#offer returns nil while an answer is outstanding and remembers the
+      # request, so calling this more often than necessary is harmless.
+      publish = ->(current : Peer, result : Symbol) do
+        connection = mumble
+        return unless connection && peer == current
+        case result
+        when :offer
+          if sdp = current.offer
+            send_signal.call({type: "offer", sdp: sdp, sections: sections_of.call(current, connection)}.to_json)
+          end
+        when :sections
+          send_signal.call({type: "sections", sections: sections_of.call(current, connection)}.to_json)
+        end
+      end
+      # libdatachannel's ICE agent can give up while the browser still believes
+      # the connection is fine, which is how a session ends up connected and
+      # permanently silent. libdatachannel has no ICE restart, so rebuild the
+      # media path instead. The Mumble connection is untouched, so this costs a
+      # DTLS handshake and nothing else -- worth it on a path that has already
+      # failed, to keep the gateway the only side that ever offers.
+      rebuild_media = nil.as(Proc(Peer, String, Nil)?)
       wire_peer = ->(new_peer : Peer) do
         new_peer.on_opus { |opus, frame_number| mumble.not_nil!.send_opus(opus, frame_number) }
-        # libdatachannel's ICE agent can give up while the browser still
-        # believes the connection is fine, which is how a session ends up
-        # connected and permanently silent. Ask the browser for an ICE restart
-        # instead of waiting for it to notice on its own; the restart offer
-        # arrives on the ordinary "offer" path and keeps Mumble authenticated,
-        # so the speaker's session IDs and tracks survive it.
         new_peer.on_connection_lost do |detail|
-          STDERR.puts "WebRTC signalling: requesting ICE restart (#{detail})"
-          spawn { send_signal.call({type: "ice_restart", reason: detail}.to_json) }
+          spawn { rebuild_media.try &.call(new_peer, detail) }
         end
-        new_peer.on_renegotiation_needed do
-          STDERR.puts "WebRTC signalling: requesting renegotiation for new speaker"
-          # This can fire from the Mumble UDP voice fiber. Hand the send to a
-          # new fiber so a slow or blocked WebSocket cannot stall voice
-          # forwarding for every speaker; the request is idempotent, so its
-          # ordering against other frames does not matter.
-          spawn { send_signal.call({type: "renegotiate"}.to_json) }
-        end
+      end
+      rebuild_media = ->(lost_peer : Peer, detail : String) do
+        return unless peer == lost_peer
+        STDERR.puts "WebRTC signalling: rebuilding the media path (#{detail})"
+        lost_peer.close
+        replacement = Peer.new
+        peer = replacement
+        wire_peer.call(replacement)
+        send_signal.call({type: "media_restart", reason: detail}.to_json)
+        connection = mumble
+        replacement.set_speakers(connection ? connection.speaker_sessions : [] of UInt32)
+        publish.call(replacement, :offer)
       end
       # Serialize cues so quick iOS mute/unmute events cannot overlap. These
       # events do not alter Mumble self-mute state or browser-audio forwarding.
@@ -118,106 +146,67 @@ module Wumble
             raise "already connected" if peer
             request = ConnectRequest.from_json(data["options"].to_json)
             validate(request)
-            peer = Peer.new
+            new_peer = Peer.new
+            peer = new_peer
             mumble = MumbleConnection.new(request.server, request.port, request.username, request.password)
             mumble.not_nil!.on_disconnect do |reason, reconnect|
               type = reconnect && !reason.starts_with?("Mumble rejected authentication") ? "mumble_disconnected" : "error"
               send_signal.call({type: type, message: reason}.to_json)
             end
-            wire_peer.call(peer.not_nil!)
+            wire_peer.call(new_peer)
+            # Every roster update goes through one place. A UserState can carry
+            # only a channel change and no name, and a UserRemove carries only a
+            # session, so reconciling the whole membership here is what keeps a
+            # join, a departure, a channel switch and a rejoin from each needing
+            # their own path. A channel switch is now just a different answer
+            # from speaker_sessions: no peer connection is rebuilt for it.
             mumble.not_nil!.on_state do
               connection = mumble.not_nil!
-              channel = connection.current_channel
               send_signal.call(channel_state(connection).to_json)
-              switched = !!(active_channel && channel && active_channel != channel)
-              if switched
-                peer.try &.close
-                peer = Peer.new
-                wire_peer.call(peer.not_nil!)
+              if current = peer
+                # set_speakers has to run here, in order, on the fiber that read
+                # the update. Publishing waits on ICE gathering, so hand that to
+                # a new fiber rather than stalling the Mumble read loop.
+                result = current.set_speakers(connection.speaker_sessions)
+                spawn { publish.call(current, result) }
               end
-              # A UserState update can contain only a channel change and no
-              # name. Reconcile the complete channel membership here rather
-              # than relying on the name-bearing on_user callback, so an
-              # already-connected browser is offered a track for every
-              # newcomer. On a fresh Peer these only populate the roster: no
-              # offer has been accepted yet, so restart_webrtc drives that.
-              speakers = connection.speaker_sessions
-              speakers.each { |speaker| peer.not_nil!.request_speaker(speaker) }
-              send_signal.call({type: "restart_webrtc", speakers: speakers.size}.to_json) if switched
-              active_channel = channel if channel
             end
-            # Give the departed speaker's audio section back so the next arrival
-            # reuses it. Always the peer of the moment: a channel switch builds
-            # a new one, which simply has nothing to release.
-            mumble.not_nil!.on_user_removed { |speaker| peer.try &.release_speaker(speaker) }
-            mumble.not_nil!.on_voice { |speaker, opus, frame_number| peer.not_nil!.send_opus(speaker, opus, frame_number) }
-            mumble.not_nil!.on_voice_end { |speaker| peer.not_nil!.end_voice(speaker) }
+            mumble.not_nil!.on_voice { |speaker, opus, frame_number| peer.try &.send_opus(speaker, opus, frame_number) }
+            mumble.not_nil!.on_voice_end { |speaker| peer.try &.end_voice(speaker) }
             # Wait for both synchronization and a working native UDP path.
             # TCP UDPTunnel voice is deliberately not a fallback because its
             # head-of-line blocking causes the latency this gateway avoids.
             mumble.not_nil!.on_ready do
               connection = mumble.not_nil!
-              connection.speaker_sessions.each { |speaker| peer.not_nil!.request_speaker(speaker) }
-              if connection.udp_available
-                send_signal.call({type: "connected", speakers: connection.speaker_sessions.size}.to_json)
-              end
+              send_signal.call({type: "connected"}.to_json) if connection.udp_available
             end
             mumble.not_nil!.on_udp_available do
               connection = mumble.not_nil!
-              connection.speaker_sessions.each { |speaker| peer.not_nil!.request_speaker(speaker) }
-              if connection.synchronized
-                send_signal.call({type: "connected", speakers: connection.speaker_sessions.size}.to_json)
-              end
+              send_signal.call({type: "connected"}.to_json) if connection.synchronized
             end
             mumble.not_nil!.on_udp_unavailable do
               send_signal.call({type: "udp_unavailable", message: "Native UDP to the Mumble server is unavailable. Check UDP port #{request.port}."}.to_json)
+            end
+            # Offer the microphone straight away. The browser can be heard as
+            # soon as the media path is up, whether or not Mumble has finished
+            # synchronizing or anybody else is in the channel yet.
+            spawn do
+              if sdp = new_peer.offer
+                send_signal.call({type: "offer", sdp: sdp, sections: [] of String}.to_json)
+              end
             end
             mumble.not_nil!.connect
           when "switch_channel"
             raise "connect before switching channels" unless mumble
             mumble.not_nil!.switch_channel(data["channel"].as_i.to_u32)
-          when "offer"
-            raise "connect before sending an offer" unless peer
-            current_peer = peer.not_nil!
-            needs_renegotiation = current_peer.accept_offer(data["sdp"].as_s)
-            STDERR.puts "WebRTC signalling: accepted browser offer; waiting for local answer"
-            spawn do
-              begin
-                # libdatachannel does not expose a Crystal-safe local-candidate
-                # callback. Poll only until its host candidate reaches the SDP,
-                # instead of imposing a one-second delay on every connection.
-                deadline = Time.instant + 250.milliseconds
-                answer = nil.as(String?)
-                loop do
-                  if local_description = current_peer.local_description
-                    answer = local_description
-                    break if local_description.includes?("a=candidate:")
-                  end
-                  break if Time.instant >= deadline
-                  sleep 10.milliseconds
-                end
-                answer ||= raise "libdatachannel did not produce an answer"
-                STDERR.puts "WebRTC signalling: local ICE candidate was not ready after 250 ms; sending available answer" unless answer.includes?("a=candidate:")
-                # A channel switch replaces peer while this fiber may still be
-                # waiting for ICE. Never send the old peer's answer after a
-                # restart_webrtc: the browser would apply it to its replacement
-                # PeerConnection and reject or corrupt the negotiation.
-                if peer == current_peer
-                  speakers = current_peer.speaker_mids.map do |session, mid|
-                    {session: session, mid: mid, name: mumble.not_nil!.users[session]? || "Session #{session}"}
-                  end
-                  send_signal.call({type: "answer", sdp: answer, description_type: "answer", speakers: speakers}.to_json)
-                  send_signal.call({type: "renegotiate"}.to_json) if needs_renegotiation
-                  STDERR.puts "WebRTC signalling: sent answer (#{answer.bytesize} bytes)"
-                else
-                  STDERR.puts "WebRTC signalling: discarding answer from replaced peer"
-                end
-              rescue ex
-                STDERR.puts "WebRTC answer error: #{ex.message || ex.class.name}"
-                STDERR.puts ex.backtrace.join('\n') if ENV["WUMBLE_DEBUG"]? == "1"
-                send_signal.call({type: "error", message: ex.message || "failed to create WebRTC answer"}.to_json)
-              end
-            end
+          when "answer"
+            raise "connect before sending an answer" unless peer
+            current = peer.not_nil!
+            # A section created while this answer was in flight could not be
+            # offered then. Now that the cycle is complete, offer again -- on a
+            # new fiber, because it waits on ICE gathering and this one is
+            # reading the signalling socket.
+            spawn { publish.call(current, :offer) } if current.accept_answer(data["sdp"].as_s)
           when "candidate"
             peer.try &.add_candidate(data["candidate"].as_s, data["mid"]?.try(&.as_s) || "0")
           else

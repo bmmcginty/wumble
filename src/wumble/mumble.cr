@@ -62,7 +62,6 @@ module Wumble
     getter on_udp_available : Proc(Nil)?
     getter on_udp_unavailable : Proc(Nil)?
     getter on_disconnect : Proc(String, Bool, Nil)?
-    getter on_user_removed : Proc(UInt32, Nil)?
     getter synchronized = false
     getter udp_available = false
 
@@ -92,15 +91,6 @@ module Wumble
       @on_user = block
     end
 
-    # Someone other than you has left the server. This is deliberately an event
-    # rather than a diff against speaker_sessions: voice reaches the gateway for
-    # users outside your channel too -- a whisper or a shout -- and a speaker
-    # bridged by their own voice packets would be released and re-bridged on
-    # every roster update if membership alone decided who belongs.
-    def on_user_removed(&block : UInt32 ->)
-      @on_user_removed = block
-    end
-
     def on_ready(&block : ->)
       @on_ready = block
     end
@@ -119,10 +109,12 @@ module Wumble
       @users.select { |session, _name| @user_channels[session]? == channel }
     end
 
-    # Everyone in your channel except you. You belong in the roster
-    # channel_state sends the browser, but never in the set of speakers bridged
-    # over WebRTC: Mumble never sends your own voice back, so a track for you
-    # can only ever be silent.
+    # Everyone in your channel except you: the complete set of speakers the
+    # gateway bridges. You belong in the roster channel_state sends the browser,
+    # but never in this set -- Mumble does not send your own voice back, so a
+    # section for you could only ever be silent. Voice from anyone outside this
+    # set, such as a whisper from another channel, is not bridged either; that
+    # is what keeps a section's owner decided in one place.
     def speaker_sessions : Array(UInt32)
       self_session = @session
       channel_users.keys.reject { |session| session == self_session }
@@ -360,7 +352,6 @@ module Wumble
       if removed_session
         @users.delete(removed_session.not_nil!)
         @user_channels.delete(removed_session.not_nil!)
-        @on_user_removed.try &.call(removed_session.not_nil!) unless removed_session == @session
         @on_state.try &.call
       end
       return unless removed_session && removed_session == @session

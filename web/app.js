@@ -10,26 +10,28 @@ let heartbeat;
 let statsTimer;
 let microphoneStream;
 let systemMicrophoneMuted = false;
-let renegotiationRequested = false;
-let renegotiationInProgress = false;
 let connectionOptions;
 let reconnectTimer;
 let reconnectAttempts = 0;
 let reconnectEnabled = false;
 let connectionActive = false;
 let wakeLock;
+// mid -> the section the gateway has assigned to that m= line: its SSRC, the
+// Mumble session holding it, and that session's name. The gateway sends this
+// whenever it changes; it is the only thing that decides which audio element
+// exists and what it is called.
 const speakerInfoByMid = new Map();
-const currentChannelSessions = new Set();
+// The gateway offers mid 0 as recvonly, so this is the section this side
+// sends its microphone on. Every other section is the gateway's to send.
+const MICROPHONE_MID = '0';
 // Element -> the remote track it plays. The track is kept because reattaching
 // after an interruption has to build a new MediaStream around the same track.
 const speakerAudio = new Map();
-// mid -> the remote track ontrack delivered for that m= section. Offered
-// sections outnumber speakers (see SPARE_SPEAKER_SECTIONS), so a section can
-// receive its track long before the gateway assigns a speaker to it. ontrack
-// fires once per section and never again, so the track has to be held here
-// until there is a speaker to build an element for.
+// mid -> the remote track ontrack delivered for that m= section. ontrack fires
+// once per section and never again, and a section outlives the speakers that
+// pass through it, so the track is held here and elements are built from it as
+// the gateway hands the section from one speaker to the next.
 const remoteTracksByMid = new Map();
-const SPARE_SPEAKER_SECTIONS = 6;
 let playbackResumeRunning = false;
 let audioProbe;
 let audioRecoveryRunning = false;
@@ -445,20 +447,28 @@ function createSpeakerArticle(mid, track, speaker, reason) {
   scheduleSpeakerReattach(audio, 'speaker element added');
 }
 
-// One article per assigned m= section. This runs both when a track arrives and
-// when an answer assigns a speaker to a section whose track arrived earlier;
-// the second case is the one spare sections made possible, and nothing else
-// would ever build an element for it.
+// One article per assigned m= section, built entirely from what the gateway
+// last said. A section with no speaker has no article; a section that changed
+// hands is relabelled in place, because its track and its SSRC did not change.
+function applySections(sections, reason) {
+  speakerInfoByMid.clear();
+  for (const section of sections || []) speakerInfoByMid.set(section.mid, section);
+  for (const article of speakers.querySelectorAll('article')) {
+    if (speakerInfoByMid.has(article.dataset.mid)) continue;
+    browserLog('removing departed speaker', { mid: article.dataset.mid || null, session: article.dataset.session || null });
+    removeSpeakerArticle(article);
+  }
+  syncSpeakerArticles(reason);
+}
+
 function syncSpeakerArticles(reason) {
   const existingByMid = new Map();
   for (const article of speakers.querySelectorAll('article')) existingByMid.set(article.dataset.mid, article);
-  for (const [mid, track] of remoteTracksByMid) {
-    const speaker = speakerInfoByMid.get(mid);
-    // A spare section the gateway has not assigned to anybody yet.
-    if (!speaker) continue;
-    // The gateway never forgets a mid, so the channel roster is what decides
-    // whether that speaker should still be on screen.
-    if (currentChannelSessions.size && !currentChannelSessions.has(String(speaker.session))) continue;
+  for (const [mid, speaker] of speakerInfoByMid) {
+    const track = remoteTracksByMid.get(mid);
+    // The gateway can name a section in the same breath as creating it. Its
+    // track arrives with the offer that follows, and this runs again then.
+    if (!track) continue;
     const existing = existingByMid.get(mid);
     if (existing) labelSpeakerArticle(existing, speaker);
     else createSpeakerArticle(mid, track, speaker, reason);
@@ -517,7 +527,10 @@ function setConnectionActive(active) {
   connectionToggle.textContent = active ? 'Disconnect' : 'Connect';
 }
 function signal(message) { socket.send(JSON.stringify(message)); }
-function updateChannels({ current_channel: currentChannel, channels, users }) {
+// The channel list only. Which speakers exist and what they are called comes
+// from the gateway's section mapping, so this no longer touches the articles:
+// the roster and the sections used to race, and whichever arrived second won.
+function updateChannels({ current_channel: currentChannel, channels }) {
   const selected = String(currentChannel ?? '');
   channelSelect.replaceChildren();
   for (const channel of (channels || []).sort((left, right) => left.name.localeCompare(right.name))) {
@@ -529,33 +542,6 @@ function updateChannels({ current_channel: currentChannel, channels, users }) {
   }
   channelControl.hidden = channelSelect.options.length === 0;
   channelSelect.disabled = !connectionActive || !selected;
-  currentChannelSessions.clear();
-  const namesBySession = new Map();
-  for (const user of users || []) {
-    const session = String(user.session);
-    currentChannelSessions.add(session);
-    namesBySession.set(session, user.name);
-  }
-  // Before ServerSync current_channel is null and the roster is necessarily
-  // empty. Do not mistake that initial partial state for every user leaving.
-  if (currentChannel == null) return;
-  for (const article of speakers.querySelectorAll('article')) {
-    const session = article.dataset.session;
-    // An answer without a mapping cannot be reconciled to the Mumble roster;
-    // retain it until its track ends or this PeerConnection is cleared.
-    if (!session) continue;
-    if (!currentChannelSessions.has(session)) {
-      browserLog('removing departed speaker', { session, mid: article.dataset.mid || null });
-      removeSpeakerArticle(article);
-      continue;
-    }
-    const name = namesBySession.get(session);
-    if (name) {
-      const label = `${name} (session ${session})`;
-      article.querySelector('h2').textContent = label;
-      article.querySelector('audio').title = label;
-    }
-  }
 }
 channelSelect.addEventListener('change', () => {
   if (connectionActive && channelSelect.value) signal({ type: 'switch_channel', channel: Number(channelSelect.value) });
@@ -684,123 +670,38 @@ function stopMicrophone() {
   systemMicrophoneMuted = false;
 }
 
-async function sendOffer(options = {}) {
-  const offer = await peer.createOffer({ offerToReceiveAudio: true, ...options });
-  await peer.setLocalDescription(offer);
-  signal({ type: 'offer', sdp: offer.sdp });
-}
-
-// Recovering the path always beats tearing the session down. Closing the
+// Recovering the media path always beats tearing the session down: closing the
 // socket drops the Mumble connection, which re-authenticates and hands every
-// speaker a new session ID and SSRC; an ICE restart keeps all of that.
-const ICE_RESTART_DELAY_MS = 4_000;
-const ICE_RESTART_LIMIT = 3;
+// speaker a new session ID. The gateway owns that recovery -- it is the only
+// side that offers, and it rebuilds its peer connection when libdatachannel
+// gives up -- so this side only has to notice when nothing recovers at all.
 const CONNECTION_GIVE_UP_MS = 25_000;
-let iceRestartAttempts = 0;
-let iceRestartInProgress = false;
-let iceRestartTimer;
 let connectionGiveUpTimer;
 
 function clearConnectionRecovery() {
-  window.clearTimeout(iceRestartTimer);
   window.clearTimeout(connectionGiveUpTimer);
-  iceRestartTimer = undefined;
   connectionGiveUpTimer = undefined;
 }
 
-async function restartIce(reason) {
-  const currentPeer = peer;
-  if (!currentPeer || iceRestartInProgress) return;
-  // A restart is itself an offer, so it cannot overlap another negotiation.
-  if (currentPeer.signalingState !== 'stable') return;
-  if (iceRestartAttempts >= ICE_RESTART_LIMIT) {
-    browserLog('ICE restart limit reached; reconnecting', { reason, attempts: iceRestartAttempts });
+function scheduleConnectionRecovery(reason) {
+  if (connectionGiveUpTimer) return;
+  connectionGiveUpTimer = window.setTimeout(() => {
+    connectionGiveUpTimer = undefined;
+    if (peer?.connectionState === 'connected') return;
+    browserLog('media path did not recover; reconnecting', { reason, connection: peer?.connectionState ?? null });
     socket?.close();
-    return;
-  }
-  iceRestartInProgress = true;
-  iceRestartAttempts += 1;
-  browserLog('ICE restart starting', {
-    reason,
-    attempt: iceRestartAttempts,
-    connection: currentPeer.connectionState,
-    ice: currentPeer.iceConnectionState,
-  });
-  try {
-    await sendOffer({ iceRestart: true });
-  } catch (error) {
-    browserError('ICE restart failed', { reason, message: String(error) });
-  } finally {
-    iceRestartInProgress = false;
-  }
+  }, CONNECTION_GIVE_UP_MS);
 }
 
-// 'disconnected' is often a transient blip that the browser repairs on its
-// own, so give it a moment before restarting, and only give up on the peer
-// connection entirely once a restart has had time to work.
-function scheduleConnectionRecovery(reason, delay = ICE_RESTART_DELAY_MS) {
-  if (!iceRestartTimer) {
-    iceRestartTimer = window.setTimeout(() => {
-      iceRestartTimer = undefined;
-      void restartIce(reason);
-    }, delay);
-  }
-  if (!connectionGiveUpTimer) {
-    connectionGiveUpTimer = window.setTimeout(() => {
-      connectionGiveUpTimer = undefined;
-      if (peer?.connectionState === 'connected') return;
-      browserLog('media path did not recover; reconnecting', { reason, connection: peer?.connectionState ?? null });
-      socket?.close();
-    }, CONNECTION_GIVE_UP_MS);
-  }
-}
-
-async function attemptRenegotiation() {
-  if (!renegotiationRequested || renegotiationInProgress || !peer || peer.signalingState !== 'stable') return;
-  renegotiationRequested = false;
-  renegotiationInProgress = true;
-  try {
-    // The gateway has learned about another Mumble speaker. Add one offered
-    // receive-only audio section so it can answer with that speaker's track.
-    peer.addTransceiver('audio', { direction: 'recvonly' });
-    await sendOffer();
-  } catch (error) {
-    renegotiationRequested = true;
-    browserError('WebRTC renegotiation failed', { message: String(error) });
-  } finally {
-    renegotiationInProgress = false;
-  }
-}
-
-async function makeOffer(speakerCount = 1) {
-  renegotiationRequested = false;
-  renegotiationInProgress = false;
+// Every m= section belongs to the gateway: it offers, this side answers, and
+// this side never adds a transceiver of its own. There is therefore no local
+// negotiation state to keep, no renegotiation to request, and no way for the
+// two sides to offer at once.
+function createPeerConnection() {
   clearConnectionRecovery();
-  iceRestartAttempts = 0;
-  iceRestartInProgress = false;
-  // Every track belongs to the PeerConnection being replaced, so drop the old
-  // elements rather than leaving dead ones for updateChannels to reap.
   clearSpeakerArticles();
   const currentPeer = new RTCPeerConnection({ iceServers: [] });
   peer = currentPeer;
-  // The microphone goes on mid 0, in both directions: libdatachannel only
-  // answers the offered sections it can pair with a local track, so the gateway
-  // claims this one with a track of its own rather than leaving it unpaired and
-  // answered inactive. Nothing is ever sent on the gateway's half, and the two
-  // directions retain independent RTP streams and Opus packets regardless.
-  peer.addTransceiver(microphoneStream.getAudioTracks()[0], { direction: 'sendrecv' });
-  // Offer more receive-only sections than there are speakers. A Mumble user
-  // who joins later can then be given a track straight away instead of the
-  // gateway having to ask for another section first and wait for the offer
-  // that carries it -- the two-phase handshake every "a speaker who joins is
-  // silent" bug has come out of. Renegotiation still happens, to publish the
-  // new section's SSRC, but it can no longer fail to find a section at all.
-  // Idle sections cost nothing but a few lines of SDP.
-  // One for the microphone, one per speaker the gateway already knows about.
-  const sections = 1 + Math.max(0, speakerCount) + SPARE_SPEAKER_SECTIONS;
-  for (let index = 1; index < sections; index += 1) {
-    peer.addTransceiver('audio', { direction: 'recvonly' });
-  }
   currentPeer.onicecandidate = ({ candidate }) => {
     if (peer !== currentPeer) return;
     if (candidate) {
@@ -816,11 +717,8 @@ async function makeOffer(speakerCount = 1) {
     if (currentPeer.connectionState === 'connected') {
       startMediaStats();
       clearConnectionRecovery();
-      iceRestartAttempts = 0;
-    } else if (currentPeer.connectionState === 'disconnected') {
-      scheduleConnectionRecovery('peer connection disconnected');
-    } else if (currentPeer.connectionState === 'failed') {
-      scheduleConnectionRecovery('peer connection failed', 0);
+    } else if (currentPeer.connectionState === 'disconnected' || currentPeer.connectionState === 'failed') {
+      scheduleConnectionRecovery(`peer connection ${currentPeer.connectionState}`);
     }
   };
   currentPeer.oniceconnectionstatechange = () => {
@@ -828,23 +726,21 @@ async function makeOffer(speakerCount = 1) {
     const details = { state: currentPeer.iceConnectionState };
     if (currentPeer.iceConnectionState === 'failed') {
       browserError('ICE failed', details);
-      scheduleConnectionRecovery('ICE failed', 0);
+      scheduleConnectionRecovery('ICE failed');
     } else browserLog('ICE connection state', details);
   };
   currentPeer.onicecandidateerror = ({ url, errorCode, errorText }) => {
     if (peer === currentPeer) browserError('ICE candidate error', { url, errorCode, errorText });
   };
   currentPeer.onsignalingstatechange = () => {
-    if (peer !== currentPeer) return;
-    browserLog('signalling state', { state: currentPeer.signalingState });
-    void attemptRenegotiation();
+    if (peer === currentPeer) browserLog('signalling state', { state: currentPeer.signalingState });
   };
   currentPeer.ontrack = ({ track, streams, transceiver }) => {
     if (peer !== currentPeer) return;
     const mid = transceiver?.mid ?? '';
     browserLog('received remote track', { id: track.id, kind: track.kind, streams: streams.length, mid, speaker: speakerInfoByMid.get(mid) ?? null });
-    // Do not combine tracks into one MediaStream. One received track means one
-    // Mumble speaker and gets its own audio element and jitter buffer.
+    // Do not combine tracks into one MediaStream. One section means one
+    // speaker at a time and gets its own audio element and jitter buffer.
     remoteTracksByMid.set(mid, track);
     track.onended = () => {
       browserLog('remote track ended', { id: track.id, mid });
@@ -855,7 +751,56 @@ async function makeOffer(speakerCount = 1) {
     };
     syncSpeakerArticles('remote track');
   };
-  await sendOffer();
+  return currentPeer;
+}
+
+// The gateway offers mid 0 as recvonly, so this side's transceiver for it is
+// already sendonly and only wants a track. Attaching it here rather than
+// declaring it up front is what lets the gateway decide every section.
+async function attachMicrophone(currentPeer) {
+  const track = microphoneStream?.getAudioTracks()[0];
+  const transceiver = currentPeer.getTransceivers().find((entry) => entry.mid === MICROPHONE_MID);
+  if (!transceiver) {
+    browserError('microphone section missing from the gateway offer', { mids: currentPeer.getTransceivers().map((entry) => entry.mid) });
+    return;
+  }
+  // Derived from the gateway's recvonly offer, but set it explicitly rather
+  // than trusting every browser to reverse the direction the same way.
+  if (transceiver.direction !== 'sendonly') transceiver.direction = 'sendonly';
+  if (!track) return;
+  if (transceiver.sender.track === track) return;
+  await transceiver.sender.replaceTrack(track);
+  browserLog('microphone attached', { mid: transceiver.mid, direction: transceiver.direction });
+}
+
+async function acceptOffer(message) {
+  const currentPeer = peer || createPeerConnection();
+  // Name the sections before the remote description, because ontrack fires
+  // while it is being applied and builds elements from this mapping.
+  speakerInfoByMid.clear();
+  for (const section of message.sections || []) speakerInfoByMid.set(section.mid, section);
+  await currentPeer.setRemoteDescription({ type: 'offer', sdp: message.sdp });
+  await attachMicrophone(currentPeer);
+  const answer = await currentPeer.createAnswer();
+  await currentPeer.setLocalDescription(answer);
+  if (peer !== currentPeer) {
+    browserLog('discarding answer from a replaced peer connection');
+    return;
+  }
+  signal({ type: 'answer', sdp: answer.sdp });
+  browserLog('answered gateway offer', { sdpBytes: answer.sdp.length, sections: speakerInfoByMid.size });
+  applySections(message.sections, 'offer');
+  setStatus('Connected');
+  // Only the transition into a connected state races the audio session, so do
+  // not rebuild every speaker's renderer each time somebody joins the channel.
+  const wasConnected = connectionActive;
+  setConnectionActive(true);
+  channelSelect.disabled = false;
+  if (!wasConnected) scheduleConnectReattach('connected');
+  // A mute can outlive a signalling reconnect, so synchronize the new gateway
+  // session even when iOS does not emit another mute event.
+  if (systemMicrophoneMuted) signal({ type: 'microphone_state', muted: true });
+  void requestWakeLock();
 }
 
 function scheduleReconnect() {
@@ -900,47 +845,22 @@ function connectSignalling() {
       return;
     } else if (message.type === 'connected') {
       reconnectAttempts = 0;
-      browserLog('creating offer', { speakers: message.speakers });
-      await makeOffer(message.speakers);
     } else if (message.type === 'channel_state') {
       updateChannels(message);
-    } else if (message.type === 'restart_webrtc') {
-      browserLog('restarting WebRTC for channel change', { speakers: message.speakers });
+    } else if (message.type === 'offer') {
+      await acceptOffer(message);
+    } else if (message.type === 'sections') {
+      // A section changed hands. Nothing in the SDP changed with it, because
+      // the SSRCs belong to the sections rather than to the speakers.
+      applySections(message.sections, 'sections');
+    } else if (message.type === 'media_restart') {
+      // libdatachannel gave up on the path and rebuilt its peer connection.
+      // Drop this side's and wait for the offer that follows.
+      browserLog('gateway rebuilt the media path', { reason: message.reason });
       peer?.close();
       peer = undefined;
       speakerInfoByMid.clear();
-      await makeOffer(message.speakers);
-    } else if (message.type === 'answer') {
-      speakerInfoByMid.clear();
-      for (const speaker of message.speakers || []) speakerInfoByMid.set(speaker.mid, speaker);
-      await peer.setRemoteDescription({ type: message.description_type, sdp: message.sdp });
-      browserLog('accepted WebRTC answer', { sdpBytes: message.sdp.length });
-      // An answer can assign a speaker to a spare section whose track arrived
-      // in an earlier negotiation; no further ontrack fires for that section.
-      syncSpeakerArticles('answer');
-      setStatus('Connected');
-      // Renegotiation answers land here too. Only the transition into a
-      // connected state raced the audio session, so do not rebuild every
-      // speaker's renderer each time somebody joins the channel.
-      const wasConnected = connectionActive;
-      setConnectionActive(true);
-      channelSelect.disabled = false;
-      if (!wasConnected) scheduleConnectReattach('connected');
-      // A mute can outlive a signalling reconnect, so synchronize the new
-      // gateway session even when iOS does not emit another mute event.
-      if (systemMicrophoneMuted) signal({ type: 'microphone_state', muted: true });
-      void requestWakeLock();
-      await attemptRenegotiation();
-    } else if (message.type === 'ice_restart') {
-      // libdatachannel gave up on the path while this side still believes it
-      // is connected, so do not wait for a local state change that will not
-      // come.
-      browserLog('gateway reported a lost media path', { reason: message.reason });
-      await restartIce('gateway');
-    } else if (message.type === 'renegotiate') {
-      browserLog('gateway requested WebRTC renegotiation');
-      renegotiationRequested = true;
-      await attemptRenegotiation();
+      clearSpeakerArticles();
     } else if (message.type === 'candidate') {
       await peer.addIceCandidate({ candidate: message.candidate, sdpMid: message.mid });
     } else if (message.type === 'mumble_disconnected') {
@@ -963,7 +883,7 @@ function connectSignalling() {
     peer?.close();
     peer = undefined;
     clearSpeakerArticles();
-    currentChannelSessions.clear();
+    clearConnectionRecovery();
     cancelConnectReattach();
     console.info(`Wumble signalling WebSocket closed (${code}: ${reason || 'no reason'})`);
     setConnectionActive(false);
@@ -990,7 +910,7 @@ form.addEventListener('submit', async (event) => {
     peer?.close();
     peer = undefined;
     clearSpeakerArticles();
-    currentChannelSessions.clear();
+    clearConnectionRecovery();
     window.clearInterval(heartbeat);
     window.clearInterval(statsTimer);
     cancelConnectReattach();
