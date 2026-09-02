@@ -93,6 +93,16 @@ module Wumble
       true
     end
 
+    # Forget a speaker who has left your channel, freeing the audio section they
+    # held for the next arrival. Returns that mid, or nil when they never got
+    # one. @renegotiation_pending is deliberately left alone: it records that an
+    # offer has been asked for and not yet arrived, which is still true, and the
+    # offer clears it when it lands.
+    def remove(session : UInt32) : String?
+      @speakers.delete(session)
+      @mids.delete(session)
+    end
+
     private def assign_speakers(&assign : UInt32, String -> Bool)
       @speakers.each do |session|
         next if @mids.has_key?(session)
@@ -205,6 +215,36 @@ module Wumble
 
     def speaker_mids : Hash(UInt32, String)
       @speaker_tracks.mids
+    end
+
+    # Every speaker this Peer is bridging or still owes a section to, so a
+    # caller can reconcile them against the Mumble roster.
+    def bridged_speakers : Array(UInt32)
+      @speaker_tracks.speakers.to_a
+    end
+
+    # A speaker who has left your channel. Free the audio section they held so
+    # the next arrival reuses it, and drop their per-session state. Without this
+    # the browser has to offer a fresh m= section for every user who has ever
+    # been in the channel with you, and a friend whose client reconnects a few
+    # times costs one apiece.
+    #
+    # The libdatachannel track is deliberately not deleted. rtcAddTrack is keyed
+    # by mid and replaces that section's description in place, so reclaiming the
+    # mid for the next speaker republishes it with their SSRC; deleting the
+    # track first would only risk the section libdatachannel is still answering.
+    def release_speaker(session : UInt32) : Nil
+      mid = @speaker_tracks.remove(session)
+      @tracks.delete(session)
+      @dropped_packets.delete(session)
+      @sent_packets.delete(session)
+      @sent_bytes.delete(session)
+      @sequence.delete(session)
+      @timestamp.delete(session)
+      @first_packet.delete(session)
+      @next_mumble_frame.delete(session)
+      @mumble_packet_frames.delete(session)
+      STDERR.puts "WebRTC: released speaker session=#{session} mid=#{mid || "none"}" if debug?
     end
 
     # Returns true when additional known speakers still need another offered

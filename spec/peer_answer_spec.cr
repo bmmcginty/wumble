@@ -56,6 +56,35 @@ describe Wumble::Peer do
     end
   end
 
+  # A user who leaves must give their m= section back. Without this the browser
+  # has to offer a fresh section for everyone who has ever been in the channel,
+  # so a friend whose client reconnects a few times costs one apiece.
+  it "reuses a departed speaker's section for the next speaker" do
+    peer = Wumble::Peer.new
+    begin
+      peer.request_speaker(41_u32)
+      peer.accept_offer(browser_offer(0, 1))
+      peer.speaker_mids.should eq({41_u32 => "1"})
+
+      peer.release_speaker(41_u32)
+      peer.bridged_speakers.should be_empty
+
+      # The same offer, with no new section in it, now covers the newcomer.
+      peer.request_speaker(42_u32)
+      peer.accept_offer(browser_offer(0, 1)).should be_false
+      peer.speaker_mids.should eq({42_u32 => "1"})
+
+      # One section per mid, republished with the new speaker's SSRC and
+      # nothing left over from the old one.
+      answer = peer.local_description.not_nil!
+      answer.scan(/^a=mid:1\r?$/m).size.should eq(1)
+      answer.should contain("a=ssrc:42 cname:wumble-42")
+      answer.should_not contain("a=ssrc:41 cname:wumble-41")
+    ensure
+      peer.close
+    end
+  end
+
   # forward_opus stamps the MID extension onto every packet, so the answer has
   # to negotiate it; otherwise the browser cannot demultiplex the BUNDLE by mid.
   it "answers with the MID header extension the offer assigned" do

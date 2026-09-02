@@ -141,8 +141,16 @@ module Wumble
               # already-connected browser is offered a track for every
               # newcomer. On a fresh Peer these only populate the roster: no
               # offer has been accepted yet, so restart_webrtc drives that.
-              connection.speaker_sessions.each { |speaker| peer.not_nil!.request_speaker(speaker) }
-              send_signal.call({type: "restart_webrtc", speakers: connection.speaker_sessions.size}.to_json) if switched
+              speakers = connection.speaker_sessions
+              peer.not_nil!.bridged_speakers.each do |speaker|
+                # Voice can reveal a speaker before its UserState arrives, and
+                # such a speaker is in no channel yet. Releasing it here would
+                # undo the bridging its own voice packets had just asked for.
+                next unless connection.known_session?(speaker)
+                peer.not_nil!.release_speaker(speaker) unless speakers.includes?(speaker)
+              end
+              speakers.each { |speaker| peer.not_nil!.request_speaker(speaker) }
+              send_signal.call({type: "restart_webrtc", speakers: speakers.size}.to_json) if switched
               active_channel = channel if channel
             end
             mumble.not_nil!.on_voice { |speaker, opus, frame_number| peer.not_nil!.send_opus(speaker, opus, frame_number) }
