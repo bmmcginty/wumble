@@ -12,9 +12,18 @@ Install Crystal plus the libdatachannel and libopus C libraries and headers thro
 
 ```sh
 crystal spec
+python3 spec/integration/signalling_test.py
 crystal build src/wumble.cr --release
 ./wumble
 ```
+
+`crystal spec` covers the pieces in isolation. `spec/integration/signalling_test.py`
+drives a built gateway through its two real interfaces -- a stub Mumble server and
+a WebSocket client -- and checks that a join, a second join, a departure and a
+rejoin each publish what they should. It needs `python3` and `openssl`, and it
+exists because the gateway once shipped with every unit spec passing and no
+speaker ever receiving an audio section. Pass `--binary` to test a gateway you
+have already built.
 
 Wumble listens on `/tmp/wumble.sock`, sets the socket group to `http`, and grants owner/group read-write access (`0660`). Point an HTTPS reverse proxy running as that group at the Unix socket, then open the proxy URL (HTTPS is required in production for iPhone microphone access, audio autoplay, and secure WebSocket access). Use `--socket` or `--group` to override the defaults. Connect sends the captured microphone as a WebRTC Opus stream; Wumble forwards its Opus payloads directly to Mumble without decoding or mixing. The connection fields are saved in the URL fragment when their inputs lose focus; fragments are not sent to the server, but passwords remain visible in browser history and copied links. Mumble connection state and control packet names are written to stderr. Set `WUMBLE_DEBUG=1` to print backtraces and periodic WebRTC diagnostics, including selected ICE addresses, browser receiver callback/pipe/forwarding counts, accepted Opus sample counts, and track send-buffer sizes.
 
