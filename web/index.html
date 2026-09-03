@@ -20,6 +20,14 @@
     <p id="status" role="status">Not connected</p>
     <label id="channel-control" hidden>Channel <select id="channel" disabled></select></label>
     <section id="speakers" aria-label="Speakers"></section>
+    <section id="messages">
+      <h2>Messages</h2>
+      <div id="message-log" role="log" aria-live="polite" aria-relevant="additions text" aria-label="Message history"></div>
+      <form id="message-form">
+        <label>Message <input id="message-input" type="text" autocomplete="off" disabled></label>
+        <button id="message-send" type="submit" disabled>Send</button>
+      </form>
+    </section>
   </main>
   <script type="module" src="app.js"></script>
 </body>

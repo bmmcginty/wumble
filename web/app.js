@@ -4,6 +4,10 @@ const speakers = document.querySelector('#speakers');
 const channelControl = document.querySelector('#channel-control');
 const channelSelect = document.querySelector('#channel');
 const connectionToggle = document.querySelector('#connection-toggle');
+const messageForm = document.querySelector('#message-form');
+const messageInput = document.querySelector('#message-input');
+const messageSend = document.querySelector('#message-send');
+const messageLog = document.querySelector('#message-log');
 let socket;
 let peer;
 let heartbeat;
@@ -589,6 +593,7 @@ window.addEventListener('pagehide', () => { void releaseWakeLock(); });
 function setConnectionActive(active) {
   connectionActive = active;
   connectionToggle.textContent = active ? 'Disconnect' : 'Connect';
+  setMessagingEnabled(active);
 }
 function signal(message) { socket.send(JSON.stringify(message)); }
 // The channel list only. Which speakers exist and what they are called comes
@@ -641,6 +646,76 @@ function forgetPresence() {
   knownChannelUsers = undefined;
   knownChannel = undefined;
 }
+
+// Mumble carries text as HTML. Rendering it would mean trusting markup from
+// anyone on the server, and a screen reader reads a flattened line more
+// predictably anyway, so parse it in an inert document and keep only the text
+// -- plus each link's URL, which is the one thing flattening would otherwise
+// throw away.
+const MESSAGE_LOG_LIMIT = 200;
+function messageToText(html) {
+  const parts = [];
+  const walk = (node) => {
+    for (const child of node.childNodes) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        parts.push(child.nodeValue);
+        continue;
+      }
+      if (child.nodeType !== Node.ELEMENT_NODE) continue;
+      const tag = child.tagName.toLowerCase();
+      if (tag === 'br') {
+        parts.push('\n');
+        continue;
+      }
+      if (tag === 'a') {
+        const text = child.textContent.trim();
+        const href = (child.getAttribute('href') || '').trim();
+        if (href && href !== text) parts.push(text ? `${text} (${href})` : href);
+        else parts.push(text || href);
+        continue;
+      }
+      walk(child);
+      if (tag === 'p' || tag === 'div' || tag === 'li') parts.push('\n');
+    }
+  };
+  try {
+    walk(new DOMParser().parseFromString(html, 'text/html').body);
+  } catch (error) {
+    browserLog('message parse failed', { message: String(error) });
+    return html;
+  }
+  return parts.join('').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// One line per message in the live region. textContent throughout: the sender
+// name comes from the server too, so it gets the same treatment as the body.
+function appendMessage(sender, body, { private: privateMessage = false } = {}) {
+  const line = document.createElement('p');
+  const label = document.createElement('span');
+  label.className = privateMessage ? 'sender private' : 'sender';
+  label.textContent = privateMessage ? `${sender} (private): ` : `${sender}: `;
+  line.append(label, document.createTextNode(body));
+  messageLog.append(line);
+  while (messageLog.childElementCount > MESSAGE_LOG_LIMIT) messageLog.firstElementChild.remove();
+  messageLog.scrollTop = messageLog.scrollHeight;
+}
+
+function setMessagingEnabled(enabled) {
+  messageInput.disabled = !enabled;
+  messageSend.disabled = !enabled;
+}
+
+messageForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  const body = messageInput.value.trim();
+  if (!body || !connectionActive || socket?.readyState !== WebSocket.OPEN) return;
+  signal({ type: 'send_text', message: body });
+  // Murmur does not echo a message back to its sender, so the only record of
+  // what was sent is the one made here.
+  appendMessage('You', body);
+  messageInput.value = '';
+  messageInput.focus();
+});
 
 channelSelect.addEventListener('change', () => {
   if (connectionActive && channelSelect.value) signal({ type: 'switch_channel', channel: Number(channelSelect.value) });
@@ -948,6 +1023,9 @@ function connectSignalling() {
       updateChannels(message);
     } else if (message.type === 'offer') {
       await acceptOffer(message);
+    } else if (message.type === 'text_message') {
+      const body = messageToText(message.message || '');
+      if (body) appendMessage(message.name, body, { private: message.private });
     } else if (message.type === 'sections') {
       // A section changed hands. Nothing in the SDP changed with it, because
       // the SSRCs belong to the sections rather than to the speakers.

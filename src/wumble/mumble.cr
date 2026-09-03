@@ -47,6 +47,7 @@ module Wumble
     # rejoining user appeared once per session they had ever held.
     USER_REMOVE       =  8
     USER_STATE        =  9
+    TEXT_MESSAGE      = 11
     PERMISSION_DENIED = 12
     CRYPT_SETUP       = 15
     CODEC_VERSION     = 21
@@ -57,6 +58,7 @@ module Wumble
     getter on_voice : Proc(UInt32, Bytes, UInt32?, Nil)?
     getter on_voice_end : Proc(UInt32, Nil)?
     getter on_user : Proc(UInt32, String, Nil)?
+    getter on_text_message : Proc(UInt32, String, Bool, Nil)?
     getter on_state : Proc(Nil)?
     getter on_ready : Proc(Nil)?
     getter on_udp_available : Proc(Nil)?
@@ -91,6 +93,12 @@ module Wumble
       @on_user = block
     end
 
+    # actor session, message body, and whether it was addressed to this user
+    # rather than to a channel.
+    def on_text_message(&block : UInt32, String, Bool ->)
+      @on_text_message = block
+    end
+
     def on_ready(&block : ->)
       @on_ready = block
     end
@@ -123,6 +131,15 @@ module Wumble
     def switch_channel(channel : UInt32)
       raise "unknown Mumble channel #{channel}" unless @channels.has_key?(channel)
       send_packet(USER_STATE, Protobuf.field(5, channel.to_u64))
+    end
+
+    # Addressed to the channel this user is in, which is the only scope the
+    # browser can send to. Mumble treats the body as HTML; the browser strips
+    # it back to text on receipt, so send it as plain text here.
+    def send_text_message(message : String)
+      raise "not in a channel yet" unless channel = current_channel
+      raise "message is empty" if message.blank?
+      send_packet(TEXT_MESSAGE, Protobuf.field(3, channel.to_u64) + Protobuf.string(5, message))
     end
 
     def on_udp_available(&block : ->)
@@ -297,6 +314,7 @@ module Wumble
         when CHANNEL_STATE then update_channel(payload)
         when USER_STATE    then update_user(payload)
         when USER_REMOVE   then user_removed(payload)
+        when TEXT_MESSAGE  then text_message(payload)
         when CRYPT_SETUP   then configure_crypt(payload)
           # Native encrypted UDP is required for voice. Do not feed the TCP
           # fallback into WebRTC, where its head-of-line blocking adds latency.
@@ -338,6 +356,24 @@ module Wumble
                       end
       members = channel_users.map { |member_session, name| "#{member_session}:#{name}" }.join(", ")
       STDERR.puts "Mumble: ServerSync snapshot self_session=#{@session || "unknown"} channel=#{channel_label} members=[#{members}]"
+    end
+
+    # TextMessage carries repeated session/channel_id/tree_id destinations. A
+    # message with no channel and no tree destination was addressed to this
+    # user directly, which is the only distinction the browser draws.
+    private def text_message(payload : Bytes)
+      actor = nil.as(UInt32?)
+      body = nil.as(String?)
+      addressed_to_channel = false
+      Protobuf.fields(payload) do |number, wire, value|
+        case number
+        when 1       then actor = Protobuf.read_varint(value, 0)[0].to_u32 if wire == 0
+        when 3, 4    then addressed_to_channel = true if wire == 0
+        when 5       then body = String.new(value) if wire == 2
+        end
+      end
+      return unless message = body
+      @on_text_message.try &.call(actor || 0_u32, message, !addressed_to_channel)
     end
 
     private def user_removed(payload : Bytes)
@@ -511,6 +547,7 @@ module Wumble
       when CHANNEL_STATE then "ChannelState"
       when USER_STATE    then "UserState"
       when USER_REMOVE   then "UserRemove"
+      when TEXT_MESSAGE  then "TextMessage"
       when PERMISSION_DENIED then "PermissionDenied"
       when CRYPT_SETUP   then "CryptSetup"
       when CODEC_VERSION then "CodecVersion"

@@ -181,6 +181,20 @@ module Wumble
                 spawn publish.call(current, result)
               end
             end
+            # Text is a separate path from voice: it never touches WebRTC, so
+            # it is forwarded straight down the signalling socket. The actor's
+            # name is resolved here because the browser only tracks sessions
+            # that hold an audio section.
+            mumble.not_nil!.on_text_message do |actor, body, private_message|
+              connection = mumble.not_nil!
+              send_signal.call({
+                type:    "text_message",
+                session: actor,
+                name:    connection.users[actor]? || "Session #{actor}",
+                message: body,
+                private: private_message,
+              }.to_json)
+            end
             mumble.not_nil!.on_voice { |speaker, opus, frame_number| peer.try &.send_opus(speaker, opus, frame_number) }
             mumble.not_nil!.on_voice_end { |speaker| peer.try &.end_voice(speaker) }
             # Wait for both synchronization and a working native UDP path.
@@ -202,6 +216,9 @@ module Wumble
             # synchronizing or anybody else is in the channel yet.
             spawn publish.call(new_peer, :offer)
             mumble.not_nil!.connect
+          when "send_text"
+            raise "connect before sending a message" unless mumble
+            mumble.not_nil!.send_text_message(data["message"].as_s)
           when "switch_channel"
             raise "connect before switching channels" unless mumble
             mumble.not_nil!.switch_channel(data["channel"].as_i.to_u32)

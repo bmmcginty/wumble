@@ -8,3 +8,10 @@ button { background: #3182ce; color: white; border: 0; cursor: pointer; }
 #speakers article { border: 1px solid #718096; border-radius: .3rem; padding: .6rem; }
 #speakers h2 { font-size: 1rem; margin: 0 0 .4rem; }
 audio { display: none; }
+#messages { margin-top: 1.5rem; }
+#messages h2 { font-size: 1rem; margin: 0 0 .4rem; }
+#message-log { border: 1px solid #718096; border-radius: .3rem; padding: .6rem; min-height: 6rem; max-height: 18rem; overflow-y: auto; margin-bottom: .8rem; }
+#message-log p { margin: 0 0 .4rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+#message-log p:last-child { margin-bottom: 0; }
+#message-log .sender { font-weight: 600; }
+#message-log .private { color: #f6ad55; }
