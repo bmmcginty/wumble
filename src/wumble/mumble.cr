@@ -394,8 +394,10 @@ module Wumble
       udp = UDPSocket.new
       udp.connect(@host, @port)
       @udp = udp
-      spawn { udp_read_loop(udp) }
-      spawn { udp_ping_loop(udp) }
+      # The call form, not `spawn { ... }`: a block closes over the caller's
+      # locals and reads them when the fiber runs.
+      spawn udp_read_loop(udp)
+      spawn udp_ping_loop(udp)
       spawn do
         sleep 3.seconds
         unless @closed || @udp_available

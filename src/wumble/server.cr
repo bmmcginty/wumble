@@ -74,9 +74,17 @@ module Wumble
       # too, so the browser is never left holding a section it cannot name.
       # Peer#offer returns nil while an answer is outstanding and remembers the
       # request, so calling this more often than necessary is harmless.
+      # Every spawn below uses `spawn call(...)` rather than `spawn { call(...) }`.
+      # The block form closes over the caller's locals and reads them when the
+      # fiber runs: `current` arrived null here, so nothing was published and a
+      # speaker who joined was never offered a section. The call form evaluates
+      # the arguments before the fiber starts.
       publish = ->(current : Peer, result : Symbol) do
         connection = mumble
-        return unless connection && peer == current
+        unless connection && peer == current
+          STDERR.puts "WebRTC signalling: skipped publishing #{result} for a replaced peer"
+          return
+        end
         case result
         when :offer
           if sdp = current.offer
@@ -96,7 +104,9 @@ module Wumble
       wire_peer = ->(new_peer : Peer) do
         new_peer.on_opus { |opus, frame_number| mumble.not_nil!.send_opus(opus, frame_number) }
         new_peer.on_connection_lost do |detail|
-          spawn { rebuild_media.try &.call(new_peer, detail) }
+          if restart = rebuild_media
+            spawn restart.call(new_peer, detail)
+          end
         end
       end
       rebuild_media = ->(lost_peer : Peer, detail : String) do
@@ -168,7 +178,7 @@ module Wumble
                 # the update. Publishing waits on ICE gathering, so hand that to
                 # a new fiber rather than stalling the Mumble read loop.
                 result = current.set_speakers(connection.speaker_sessions)
-                spawn { publish.call(current, result) }
+                spawn publish.call(current, result)
               end
             end
             mumble.not_nil!.on_voice { |speaker, opus, frame_number| peer.try &.send_opus(speaker, opus, frame_number) }
@@ -190,11 +200,7 @@ module Wumble
             # Offer the microphone straight away. The browser can be heard as
             # soon as the media path is up, whether or not Mumble has finished
             # synchronizing or anybody else is in the channel yet.
-            spawn do
-              if sdp = new_peer.offer
-                send_signal.call({type: "offer", sdp: sdp, sections: [] of String}.to_json)
-              end
-            end
+            spawn publish.call(new_peer, :offer)
             mumble.not_nil!.connect
           when "switch_channel"
             raise "connect before switching channels" unless mumble
@@ -206,7 +212,7 @@ module Wumble
             # offered then. Now that the cycle is complete, offer again -- on a
             # new fiber, because it waits on ICE gathering and this one is
             # reading the signalling socket.
-            spawn { publish.call(current, :offer) } if current.accept_answer(data["sdp"].as_s)
+            spawn publish.call(current, :offer) if current.accept_answer(data["sdp"].as_s)
           when "candidate"
             peer.try &.add_candidate(data["candidate"].as_s, data["mid"]?.try(&.as_s) || "0")
           else
