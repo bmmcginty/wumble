@@ -34,6 +34,16 @@ const speakerAudio = new Map();
 const remoteTracksByMid = new Map();
 let playbackResumeRunning = false;
 let audioProbe;
+// A second context, separate from audioProbe on purpose: the probe has nothing
+// connected to it so its state is a clean read on the page's audio session,
+// and the join/leave cues are the page's own sound rather than speaker audio.
+let cueContext;
+// session -> name for the channel the gateway last reported. Join and leave
+// cues are the difference between this and the next roster, so it starts empty
+// and is replaced without a sound whenever the whole membership changes at
+// once: the snapshot after connecting, and a channel switch.
+let knownChannelUsers;
+let knownChannel;
 let audioRecoveryRunning = false;
 let audioRecoveryNeeded = false;
 const connectionFragmentFields = [
@@ -358,6 +368,60 @@ async function resumeAudioProbe(reason) {
   }
 }
 
+// Join and leave cues are heard by this browser only. They are synthesized
+// here rather than sent through Mumble like the microphone-state cue, because
+// the rest of the channel has no reason to hear who arrived on this page's
+// screen reader. Two 120 ms notes: rising for an arrival, falling for a
+// departure.
+const CUE_NOTE_SECONDS = 0.12;
+const CUE_LOW_HZ = 440;
+const CUE_HIGH_HZ = 880;
+const CUE_GAIN = 0.14;
+function startCueContext() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (cueContext || !AudioContextClass) return;
+  cueContext = new AudioContextClass();
+  browserLog('cue context created', { state: cueContext.state });
+}
+
+function stopCueContext() {
+  if (!cueContext) return;
+  const context = cueContext;
+  cueContext = undefined;
+  void context.close().catch(() => {});
+}
+
+function playPresenceCue(rising) {
+  if (!cueContext) return;
+  // A context suspended by an interruption or by autoplay policy resumes on
+  // its own once the page is interactive again; a failed cue is not worth
+  // reporting as an error, only as a missed sound.
+  if (cueContext.state !== 'running') void cueContext.resume().catch(() => {});
+  try {
+    const start = cueContext.currentTime;
+    const gain = cueContext.createGain();
+    gain.connect(cueContext.destination);
+    // Match the Mumble-side cue's short attack and release so neither note
+    // clicks, and so the two cues sound like the same instrument.
+    const notes = rising ? [CUE_LOW_HZ, CUE_HIGH_HZ] : [CUE_HIGH_HZ, CUE_LOW_HZ];
+    gain.gain.setValueAtTime(0, start);
+    notes.forEach((frequency, index) => {
+      const noteStart = start + index * CUE_NOTE_SECONDS;
+      const oscillator = cueContext.createOscillator();
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(frequency, noteStart);
+      oscillator.connect(gain);
+      oscillator.start(noteStart);
+      oscillator.stop(noteStart + CUE_NOTE_SECONDS);
+      gain.gain.linearRampToValueAtTime(CUE_GAIN, noteStart + 0.005);
+      gain.gain.setValueAtTime(CUE_GAIN, noteStart + CUE_NOTE_SECONDS - 0.005);
+    });
+    gain.gain.linearRampToValueAtTime(0, start + notes.length * CUE_NOTE_SECONDS);
+  } catch (error) {
+    browserLog('presence cue failed', { rising, message: String(error) });
+  }
+}
+
 function stopAudioProbe() {
   if (!audioProbe) return;
   const context = audioProbe;
@@ -530,8 +594,9 @@ function signal(message) { socket.send(JSON.stringify(message)); }
 // The channel list only. Which speakers exist and what they are called comes
 // from the gateway's section mapping, so this no longer touches the articles:
 // the roster and the sections used to race, and whichever arrived second won.
-function updateChannels({ current_channel: currentChannel, channels }) {
+function updateChannels({ current_channel: currentChannel, channels, users }) {
   const selected = String(currentChannel ?? '');
+  updatePresence(currentChannel, users);
   channelSelect.replaceChildren();
   for (const channel of (channels || []).sort((left, right) => left.name.localeCompare(right.name))) {
     const option = document.createElement('option');
@@ -543,6 +608,40 @@ function updateChannels({ current_channel: currentChannel, channels }) {
   channelControl.hidden = channelSelect.options.length === 0;
   channelSelect.disabled = !connectionActive || !selected;
 }
+// Who is in the channel, purely so an arrival or a departure can be heard.
+// Nothing visual depends on this: the articles come from the gateway's section
+// mapping. A whole-membership change -- the first roster after connecting, and
+// a channel switch -- is adopted silently, because a burst of cues for people
+// who were already there says nothing about who just moved.
+function updatePresence(currentChannel, users) {
+  const roster = new Map((users || []).map((user) => [user.session, user.name]));
+  const wholesale = knownChannelUsers === undefined || currentChannel !== knownChannel;
+  const previous = knownChannelUsers;
+  knownChannelUsers = roster;
+  knownChannel = currentChannel;
+  if (wholesale) {
+    browserLog('channel roster adopted without cues', { channel: currentChannel ?? null, users: roster.size });
+    return;
+  }
+  for (const [session, name] of roster) {
+    if (!previous.has(session)) {
+      browserLog('speaker joined the channel', { session, name });
+      playPresenceCue(true);
+    }
+  }
+  for (const [session, name] of previous) {
+    if (!roster.has(session)) {
+      browserLog('speaker left the channel', { session, name });
+      playPresenceCue(false);
+    }
+  }
+}
+
+function forgetPresence() {
+  knownChannelUsers = undefined;
+  knownChannel = undefined;
+}
+
 channelSelect.addEventListener('change', () => {
   if (connectionActive && channelSelect.value) signal({ type: 'switch_channel', channel: Number(channelSelect.value) });
 });
@@ -885,6 +984,7 @@ function connectSignalling() {
     clearSpeakerArticles();
     clearConnectionRecovery();
     cancelConnectReattach();
+    forgetPresence();
     console.info(`Wumble signalling WebSocket closed (${code}: ${reason || 'no reason'})`);
     setConnectionActive(false);
     channelSelect.disabled = true;
@@ -895,6 +995,7 @@ function connectSignalling() {
       stopMicrophone();
       stopAudioProbe();
       audioRecoveryNeeded = false;
+      stopCueContext();
       setStatus(`Disconnected (${code})`);
     }
   };
@@ -919,6 +1020,8 @@ form.addEventListener('submit', async (event) => {
     // the next connect then races its rebuild.
     suspendMicrophone();
     audioRecoveryNeeded = false;
+    stopCueContext();
+    forgetPresence();
     setConnectionActive(false);
     channelSelect.disabled = true;
     void releaseWakeLock();
@@ -958,5 +1061,6 @@ form.addEventListener('submit', async (event) => {
   // Same reason: a context created outside a gesture starts suspended, which
   // would be indistinguishable from the interruption it exists to report.
   startAudioProbe();
+  startCueContext();
   connectSignalling();
 });
