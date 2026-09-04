@@ -228,56 +228,96 @@ async function reattachSpeakerAudio(reason) {
   for (const audio of [...speakerAudio.keys()]) await reattachSpeakerElement(audio, reason);
 }
 
-// A connect binds new audio elements while iOS may still be rebuilding the
-// audio session the previous connection tore down. The elements then report
-// playing -- readyState 4, currentTime advancing, inbound-rtp showing real
-// audio energy -- while nothing reaches the speaker: the same silent-renderer
-// state a Siri interruption leaves behind, reached by a different route.
-// Nothing on the connect path detects it, because the elements are not paused
-// and so resumeSpeakerPlayback is a no-op. Rebuild them unconditionally once
-// the session has had a moment to settle; twice, because how long that takes
-// is not observable from script.
-let connectReattachTimers = [];
-function cancelConnectReattach() {
-  for (const timer of connectReattachTimers) window.clearTimeout(timer);
-  connectReattachTimers = [];
+// The page cannot observe whether an element is audible. Across a whole silent
+// stretch and through the recovery that ended it, the element reports playing
+// and its inbound-rtp advances totalSamplesDuration at exactly one second per
+// second, with no discontinuity at the moment sound comes back. There is
+// nothing to poll for "is this rendering?", so verification has to be built on
+// the one thing that is observable: whether iOS has left the page's audio
+// session alone long enough for a rebuilt renderer to survive.
+//
+// Every rebuild the connect path used to do landed inside that window -- 250 ms
+// and 1500 ms after a fresh getUserMedia, while iOS was still standing the
+// session back up -- and the elements then stayed silent until an unrelated
+// microphone interruption happened to rebuild them again minutes later.
+const AUDIO_SESSION_SETTLE_MS = 3_000;
+let audioSessionDisturbedAt = Date.now();
+function markAudioSessionDisturbed(reason) {
+  audioSessionDisturbedAt = Date.now();
+  browserLog('audio session disturbed', { reason });
 }
 
-function scheduleConnectReattach(reason) {
-  cancelConnectReattach();
-  for (const delay of [250, 1_500]) {
-    connectReattachTimers.push(window.setTimeout(() => {
-      if (!connectionActive) return;
-      void reattachSpeakerAudio(reason);
-    }, delay));
+// Everything iOS does to the session arrives as one of these: a capture taken
+// away or handed back, or a context parked outside 'running'.
+function audioSessionSettled() {
+  if (Date.now() - audioSessionDisturbedAt < AUDIO_SESSION_SETTLE_MS) return false;
+  if (audioProbe && audioProbe.state !== 'running') return false;
+  const track = microphoneStream?.getAudioTracks()[0];
+  return Boolean(track) && track.readyState === 'live' && !track.muted;
+}
+
+// One pass per element: wait for the session to settle, rebuild the renderer,
+// then rebuild once more to confirm. A disturbance arriving between the two
+// discards the first and restarts the wait, so both rebuilds are always
+// separated from the last thing iOS did to the session -- which is the whole
+// difference from the two fixed timers this replaces. Per element rather than
+// per connection because a speaker who joins later needs the same treatment,
+// and because rebuilding one must never interrupt another already audible.
+const VERIFY_FIRST_MS = 250;
+const VERIFY_POLL_MS = 500;
+const VERIFY_CONFIRM_MS = 2_000;
+const VERIFY_DEADLINE_MS = 30_000;
+const speakerVerifyTimers = new Map();
+
+function cancelSpeakerVerification(audio) {
+  const timer = speakerVerifyTimers.get(audio);
+  if (timer !== undefined) window.clearTimeout(timer);
+  speakerVerifyTimers.delete(audio);
+}
+
+function cancelAllSpeakerVerification() {
+  for (const audio of [...speakerVerifyTimers.keys()]) cancelSpeakerVerification(audio);
+}
+
+function verifySpeakerRendering(audio, reason) {
+  cancelSpeakerVerification(audio);
+  const deadline = Date.now() + VERIFY_DEADLINE_MS;
+  let rebuilt = false;
+
+  function schedule(delay) {
+    speakerVerifyTimers.set(audio, window.setTimeout(step, delay));
   }
-}
 
-// A speaker who joins after connect gets an element built in exactly the state
-// described above, and nothing covers it: scheduleConnectReattach has already
-// run and will not run again, and resumeSpeakerPlayback is a no-op because the
-// new element is not paused. It reports playing, its inbound-rtp carries real
-// audio energy, and it stays silent until the page is reloaded. Give the new
-// element the same double rebuild the connect path gives all of them, one
-// element at a time so an already-audible speaker is never interrupted.
-const speakerReattachTimers = new Map();
-function cancelSpeakerReattach(audio) {
-  for (const timer of speakerReattachTimers.get(audio) || []) window.clearTimeout(timer);
-  speakerReattachTimers.delete(audio);
-}
-
-function scheduleSpeakerReattach(audio, reason) {
-  cancelSpeakerReattach(audio);
-  const timers = [];
-  for (const delay of [250, 1_500]) {
-    timers.push(window.setTimeout(() => {
-      // The element may have been removed with its speaker in the meantime.
-      if (!connectionActive || !speakerAudio.has(audio)) return;
-      browserLog('reattaching new speaker', { reason, session: audio.dataset.session || null, delay });
-      void reattachSpeakerElement(audio, reason);
-    }, delay));
+  function step() {
+    speakerVerifyTimers.delete(audio);
+    // The element may have been removed with its speaker in the meantime.
+    if (!connectionActive || !speakerAudio.has(audio)) return;
+    const session = audio.dataset.session || null;
+    const settledFor = Date.now() - audioSessionDisturbedAt;
+    if (!audioSessionSettled()) {
+      // A rebuild from before this disturbance proves nothing about now.
+      rebuilt = false;
+      if (Date.now() >= deadline) {
+        // recoverAudio stays armed for the interruption that is still running,
+        // and re-arms this pass when it finishes.
+        browserLog('speaker verification abandoned', { reason, session, settledFor, audioContext: audioProbe?.state ?? null });
+        return;
+      }
+      schedule(VERIFY_POLL_MS);
+      return;
+    }
+    browserLog('rebuilding speaker renderer', { reason, session, settledFor, confirmation: rebuilt });
+    void reattachSpeakerElement(audio, reason);
+    if (rebuilt) return;
+    rebuilt = true;
+    schedule(VERIFY_CONFIRM_MS);
   }
-  speakerReattachTimers.set(audio, timers);
+
+  schedule(VERIFY_FIRST_MS);
+}
+
+function verifyAllSpeakerRendering(reason) {
+  for (const audio of [...speakerAudio.keys()]) verifySpeakerRendering(audio, reason);
 }
 
 // Rebuild what the interruption tore down, in dependency order: the audio
@@ -312,6 +352,7 @@ async function recoverAudio(reason) {
     await resumeAudioProbe(reason);
     await reattachSpeakerAudio(reason);
     await resumeSpeakerPlayback(reason);
+    verifyAllSpeakerRendering(reason);
     browserLog('audio recovery finished', { reason, audioContext: audioProbe?.state ?? null });
   } catch (error) {
     browserError('audio recovery failed', { reason, message: String(error), name: error.name });
@@ -351,6 +392,7 @@ function startAudioProbe() {
     // 'interrupted' is a first-hand report that iOS took the session away,
     // which a system capture mute only implies. Arm on it as well so an
     // interruption that never mutes the capture still gets recovered.
+    if (state !== 'running') markAudioSessionDisturbed(`audio context ${state}`);
     if (state === 'interrupted') audioRecoveryNeeded = true;
     else maybeRecoverAudio('audio context state');
   };
@@ -436,7 +478,7 @@ function stopAudioProbe() {
 
 function removeSpeakerArticle(article) {
   for (const audio of article.querySelectorAll('audio')) {
-    cancelSpeakerReattach(audio);
+    cancelSpeakerVerification(audio);
     speakerAudio.delete(audio);
   }
   article.remove();
@@ -444,7 +486,7 @@ function removeSpeakerArticle(article) {
 
 function clearSpeakerArticles() {
   speakers.replaceChildren();
-  for (const audio of speakerAudio.keys()) cancelSpeakerReattach(audio);
+  for (const audio of speakerAudio.keys()) cancelSpeakerVerification(audio);
   speakerAudio.clear();
   speakerInfoByMid.clear();
   remoteTracksByMid.clear();
@@ -512,7 +554,7 @@ function createSpeakerArticle(mid, track, speaker, reason) {
   void resumeSpeakerPlayback('speaker element added');
   // ...and an element that does start playing can still be rendering into
   // nothing, which only a rebuild repairs.
-  scheduleSpeakerReattach(audio, 'speaker element added');
+  verifySpeakerRendering(audio, 'speaker element added');
 }
 
 // One article per assigned m= section, built entirely from what the gateway
@@ -786,6 +828,7 @@ async function captureMicrophone(restart = false) {
     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     video: false,
   });
+  markAudioSessionDisturbed('microphone captured');
   const capturedStream = microphoneStream;
   const audioTrack = capturedStream.getAudioTracks()[0];
   systemMicrophoneMuted = audioTrack?.muted ?? false;
@@ -799,6 +842,7 @@ async function captureMicrophone(restart = false) {
       // visibility alone is not: a desktop tab switch would then tear down and
       // rebuild every speaker element for nothing.
       audioRecoveryNeeded = true;
+      markAudioSessionDisturbed('microphone muted by system');
       browserLog('microphone muted by system', { muted: audioTrack.muted, enabled: audioTrack.enabled, readyState: audioTrack.readyState });
       if (socket?.readyState === WebSocket.OPEN) signal({ type: 'microphone_state', muted: true });
     };
@@ -806,6 +850,7 @@ async function captureMicrophone(restart = false) {
       if (microphoneStream !== capturedStream) return;
       systemMicrophoneMuted = false;
       audioTrack.enabled = true;
+      markAudioSessionDisturbed('microphone unmuted by system');
       browserLog('microphone unmuted by system', { muted: audioTrack.muted, enabled: audioTrack.enabled, readyState: audioTrack.readyState });
       if (socket?.readyState === WebSocket.OPEN) signal({ type: 'microphone_state', muted: false });
       // iOS may release the wake lock during a system audio interruption;
@@ -834,6 +879,7 @@ function suspendMicrophone() {
 }
 
 function stopMicrophone() {
+  if (microphoneStream) markAudioSessionDisturbed('microphone stopped');
   const stream = microphoneStream;
   microphoneStream = undefined;
   stream?.getTracks().forEach((track) => {
@@ -970,7 +1016,7 @@ async function acceptOffer(message) {
   const wasConnected = connectionActive;
   setConnectionActive(true);
   channelSelect.disabled = false;
-  if (!wasConnected) scheduleConnectReattach('connected');
+  if (!wasConnected) verifyAllSpeakerRendering('connected');
   // A mute can outlive a signalling reconnect, so synchronize the new gateway
   // session even when iOS does not emit another mute event.
   if (systemMicrophoneMuted) signal({ type: 'microphone_state', muted: true });
@@ -1061,7 +1107,7 @@ function connectSignalling() {
     peer = undefined;
     clearSpeakerArticles();
     clearConnectionRecovery();
-    cancelConnectReattach();
+    cancelAllSpeakerVerification();
     forgetPresence();
     console.info(`Wumble signalling WebSocket closed (${code}: ${reason || 'no reason'})`);
     setConnectionActive(false);
@@ -1092,7 +1138,7 @@ form.addEventListener('submit', async (event) => {
     clearConnectionRecovery();
     window.clearInterval(heartbeat);
     window.clearInterval(statsTimer);
-    cancelConnectReattach();
+    cancelAllSpeakerVerification();
     // Keep the capture and the audio context across a user-initiated
     // disconnect. Closing either one destroys the page's audio session, and
     // the next connect then races its rebuild.
