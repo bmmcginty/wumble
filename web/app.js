@@ -476,17 +476,46 @@ function stopAudioProbe() {
   void context.close().catch(() => {});
 }
 
+// iOS Safari grants autoplay per element, to elements it has already allowed
+// to play. An element built on a later connect carries none of that history,
+// which is how a reconnect ends up with speakers that report playing and are
+// never heard. So elements are never thrown away: a released one is stripped
+// of its speaker and kept, and the next arrival is given it back. This mirrors
+// the gateway's own m= sections, and settles at the same high-water mark of
+// simultaneous speakers rather than reserving anything in advance.
+const recycledSpeakerAudio = [];
+
+function takeSpeakerAudio() {
+  return recycledSpeakerAudio.pop() ?? document.createElement('audio');
+}
+
+// Strip the element back to something a different speaker can be given, while
+// keeping the element itself. Detaching the stream is deliberate: holding a
+// departed speaker's track here would keep it alive for nothing.
+function releaseSpeakerAudio(audio) {
+  cancelSpeakerVerification(audio);
+  speakerAudio.delete(audio);
+  audio.pause();
+  audio.srcObject = null;
+  audio.onplaying = null;
+  audio.onwaiting = null;
+  audio.onstalled = null;
+  audio.onerror = null;
+  audio.removeAttribute('title');
+  delete audio.dataset.session;
+  delete audio.dataset.trackId;
+  audio.remove();
+  if (!recycledSpeakerAudio.includes(audio)) recycledSpeakerAudio.push(audio);
+}
+
 function removeSpeakerArticle(article) {
-  for (const audio of article.querySelectorAll('audio')) {
-    cancelSpeakerVerification(audio);
-    speakerAudio.delete(audio);
-  }
+  for (const audio of article.querySelectorAll('audio')) releaseSpeakerAudio(audio);
   article.remove();
 }
 
 function clearSpeakerArticles() {
+  for (const audio of [...speakerAudio.keys()]) releaseSpeakerAudio(audio);
   speakers.replaceChildren();
-  for (const audio of speakerAudio.keys()) cancelSpeakerVerification(audio);
   speakerAudio.clear();
   speakerInfoByMid.clear();
   remoteTracksByMid.clear();
@@ -510,7 +539,7 @@ function createSpeakerArticle(mid, track, speaker, reason) {
   const container = document.createElement('article');
   const heading = document.createElement('h2');
   heading.textContent = label;
-  const audio = document.createElement('audio');
+  const audio = takeSpeakerAudio();
   audio.autoplay = true;
   audio.controls = true;
   audio.title = label;
