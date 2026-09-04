@@ -501,6 +501,7 @@ function releaseSpeakerAudio(audio) {
   audio.onwaiting = null;
   audio.onstalled = null;
   audio.onerror = null;
+  audio.volume = 1;
   audio.removeAttribute('title');
   delete audio.dataset.session;
   delete audio.dataset.trackId;
@@ -533,6 +534,40 @@ function labelSpeakerArticle(article, speaker) {
   }
 }
 
+// iOS Safari ignores HTMLMediaElement.volume: the assignment is accepted and
+// the property reads back unchanged, so the slider moved and nothing happened.
+// Routing speaker audio through a Web Audio gain node is how other clients get
+// a working control, and that is the path this page tried and reverted. Feature
+// test the property rather than sniffing the user agent, and leave the control
+// out where it cannot do anything -- a dead slider in the speaker list is worse
+// than no slider, especially to a screen reader.
+let elementVolumeSupported;
+function supportsElementVolume() {
+  if (elementVolumeSupported === undefined) {
+    const probe = document.createElement('audio');
+    probe.volume = 0.5;
+    elementVolumeSupported = probe.volume === 0.5;
+    browserLog('element volume support', { supported: elementVolumeSupported });
+  }
+  return elementVolumeSupported;
+}
+
+function createSpeakerVolume(audio) {
+  if (!supportsElementVolume()) return undefined;
+  const volume = document.createElement('input');
+  volume.type = 'range';
+  volume.min = '0';
+  volume.max = '100';
+  volume.step = '1';
+  volume.value = '100';
+  volume.setAttribute('aria-label', 'Volume');
+  volume.addEventListener('change', () => {
+    const percent = Number(volume.value);
+    audio.volume = Number.isFinite(percent) ? Math.min(100, Math.max(0, percent)) / 100 : 1;
+  });
+  return volume;
+}
+
 function createSpeakerArticle(mid, track, speaker, reason) {
   const label = `${speaker.name} (session ${speaker.session})`;
   browserLog('building speaker element', { mid, session: speaker.session, reason });
@@ -549,17 +584,7 @@ function createSpeakerArticle(mid, track, speaker, reason) {
   audio.srcObject = new MediaStream([track]);
   audio.dataset.trackId = track.id;
   audio.dataset.session = String(speaker.session);
-  const volume = document.createElement('input');
-  volume.type = 'range';
-  volume.min = '0';
-  volume.max = '100';
-  volume.step = '1';
-  volume.value = '100';
-  volume.setAttribute('aria-label', 'Volume');
-  volume.addEventListener('change', () => {
-    const percent = Number(volume.value);
-    audio.volume = Number.isFinite(percent) ? Math.min(100, Math.max(0, percent)) / 100 : 1;
-  });
+  const volume = createSpeakerVolume(audio);
   audio.onplaying = () => browserLog('speaker audio playing', { track: track.id, session: speaker.session, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
   audio.onwaiting = () => {
     browserLog('speaker audio waiting', { track: track.id, session: speaker.session, readyState: audio.readyState, currentTime: metric(audio.currentTime) });
@@ -574,7 +599,7 @@ function createSpeakerArticle(mid, track, speaker, reason) {
   track.onunmute = () => browserLog('remote track unmuted', { id: track.id, session: speaker.session });
   container.dataset.session = String(speaker.session);
   container.dataset.mid = mid;
-  container.append(heading, volume, audio);
+  container.append(...[heading, volume, audio].filter(Boolean));
   speakers.append(container);
   speakerAudio.set(audio, track);
   // A track that arrives while the audio session is interrupted cannot
