@@ -8,6 +8,9 @@ const messageForm = document.querySelector('#message-form');
 const messageInput = document.querySelector('#message-input');
 const messageSend = document.querySelector('#message-send');
 const messageLog = document.querySelector('#message-log');
+const audioAlert = document.querySelector('#audio-alert');
+const audioAlertText = document.querySelector('#audio-alert-text');
+const restoreAudioButton = document.querySelector('#restore-audio');
 let socket;
 let peer;
 let heartbeat;
@@ -169,6 +172,9 @@ async function resumeSpeakerPlayback(reason) {
             message: String(error),
             name: error.name,
           });
+          // Safari refusing the play outright is the one failure a tap fixes
+          // directly, so there is nothing to gain from further attempts.
+          if (error.name === 'NotAllowedError') offerAudioRestore('speaker playback not allowed');
         }
       }
       if (![...speakerAudio.keys()].some((audio) => audio.paused)) return;
@@ -301,6 +307,7 @@ function verifySpeakerRendering(audio, reason) {
         // recoverAudio stays armed for the interruption that is still running,
         // and re-arms this pass when it finishes.
         browserLog('speaker verification abandoned', { reason, session, settledFor, audioContext: audioProbe?.state ?? null });
+        offerAudioRestore('speaker verification abandoned');
         return;
       }
       schedule(VERIFY_POLL_MS);
@@ -341,6 +348,7 @@ async function recoverAudio(reason) {
     // the next visibility or focus event to retry.
     audioRecoveryNeeded = true;
     browserLog('audio recovery timed out', { reason, audioContext: audioProbe?.state ?? null });
+    offerAudioRestore('audio recovery timed out');
   }, AUDIO_RECOVERY_TIMEOUT_MS);
   try {
     browserLog('audio recovery starting', {
@@ -356,12 +364,46 @@ async function recoverAudio(reason) {
     browserLog('audio recovery finished', { reason, audioContext: audioProbe?.state ?? null });
   } catch (error) {
     browserError('audio recovery failed', { reason, message: String(error), name: error.name });
+    offerAudioRestore('audio recovery failed');
   } finally {
     window.clearTimeout(audioRecoveryWatchdog);
     audioRecoveryWatchdog = undefined;
     audioRecoveryRunning = false;
   }
 }
+
+// Every repair on this page needs an audio session iOS is willing to give
+// back, and the surest way to get one is a tap. When the automatic paths have
+// run out -- a play() refused outright, a recovery that timed out, a
+// verification that never saw the session settle -- stop guessing and ask for
+// one, rather than leaving the page reporting three speakers and playing
+// nothing. Deliberately not withdrawn when an element reports playing: that is
+// exactly what a silent renderer also reports, so only the tap or a disconnect
+// takes the offer back.
+let audioRestoreOffered = false;
+function offerAudioRestore(reason) {
+  if (audioRestoreOffered || !connectionActive) return;
+  audioRestoreOffered = true;
+  browserLog('offering audio restore', { reason, audioContext: audioProbe?.state ?? null, speakers: speakerAudio.size });
+  audioAlertText.textContent = 'Speaker audio may not be playing.';
+  audioAlert.hidden = false;
+}
+
+function withdrawAudioRestore(reason) {
+  if (!audioRestoreOffered) return;
+  audioRestoreOffered = false;
+  browserLog('withdrawing audio restore', { reason });
+  audioAlert.hidden = true;
+  audioAlertText.textContent = '';
+}
+
+restoreAudioButton.addEventListener('click', () => {
+  withdrawAudioRestore('audio restore requested');
+  // recoverAudio resumes the probe and rebuilds every renderer; the cue context
+  // is the one thing it does not touch, and a tap is what it needs too.
+  if (cueContext && cueContext.state !== 'running') void cueContext.resume().catch(() => {});
+  void recoverAudio('audio restore');
+});
 
 // The interruption ends in several steps that arrive in any order: the page
 // becomes visible again, the capture unmutes, and the audio context leaves
@@ -687,6 +729,7 @@ window.addEventListener('focus', () => {
 });
 window.addEventListener('pagehide', () => { void releaseWakeLock(); });
 function setConnectionActive(active) {
+  if (!active) withdrawAudioRestore('disconnected');
   connectionActive = active;
   connectionToggle.textContent = active ? 'Disconnect' : 'Connect';
   setMessagingEnabled(active);
