@@ -95,6 +95,7 @@ module Wumble
       @last_browser_voice_at = nil.as(Time::Instant?)
       @cue_active = false
       @voice_slip_frames = 0_i64
+      @voice_slip_peak_frames = 0_i64
       @voice_resyncs = 0_u64
       @voice_terminators = 0_u64
       @voice_cue_dropped_packets = 0_u64
@@ -218,6 +219,9 @@ module Wumble
         wall_frame = wall_clock_frame(now)
         anchored_frame = @voice_anchor_frame &+ (frame_number &- @voice_anchor_browser_frame)
         @voice_slip_frames = anchored_frame.to_i64 - wall_frame.to_i64
+        # Recorded before the re-anchor below, so the peak shows how far the
+        # browser clock had actually wandered rather than where it landed.
+        @voice_slip_peak_frames = @voice_slip_frames.abs if @voice_slip_frames.abs > @voice_slip_peak_frames
         # Re-anchor when there is no open talkspurt, and when the browser clock
         # has slipped far enough from the gateway clock that continuing to
         # follow the browser clock would build a permanent offset. One rule
@@ -305,12 +309,19 @@ module Wumble
     # how far the outgoing frame numbering has slipped from wall clock. It is
     # logged unconditionally rather than under WUMBLE_DEBUG because a slip that
     # only appears during a real conversation is the whole failure mode.
+    #
+    # slip_ms is the last packet's slip; peak_slip_ms is the worst slip since
+    # the previous report. Without peak_slip_ms a drift building between two
+    # re-anchors is invisible until the drift trips VOICE_RESYNC_FRAMES and
+    # shows up only as another increment of resyncs.
     private def voice_timeline_loop
       until @closed
         sleep VOICE_TIMELINE_REPORT
         break if @closed
         next unless @voice_epoch
-        STDERR.puts "Mumble voice timeline: slip_ms=#{@voice_slip_frames * 10} resyncs=#{@voice_resyncs} terminators=#{@voice_terminators} cue_dropped_packets=#{@voice_cue_dropped_packets}"
+        peak = @voice_slip_peak_frames
+        @voice_slip_peak_frames = 0_i64
+        STDERR.puts "Mumble voice timeline: slip_ms=#{@voice_slip_frames * 10} peak_slip_ms=#{peak * 10} resyncs=#{@voice_resyncs} terminators=#{@voice_terminators} cue_dropped_packets=#{@voice_cue_dropped_packets}"
       end
     end
 
