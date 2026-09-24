@@ -52,6 +52,14 @@ module Wumble
     CRYPT_SETUP       = 15
     CODEC_VERSION     = 21
 
+    # Browser capture stopped for longer than this ends the talkspurt.
+    VOICE_GAP_THRESHOLD = 200.milliseconds
+    VOICE_GAP_POLL      = 100.milliseconds
+    # Slip between the browser clock and the gateway clock, in 10 ms frames,
+    # that forces a re-anchor. 20 frames is the same 200 ms as the gap rule.
+    VOICE_RESYNC_FRAMES    = 20_i64
+    VOICE_TIMELINE_REPORT  = 30.seconds
+
     getter users = Hash(UInt32, String).new
     getter channels = Hash(UInt32, String).new
     getter user_channels = Hash(UInt32, UInt32).new
@@ -77,8 +85,19 @@ module Wumble
       @session = nil.as(UInt32?)
       @voice_send_lock = Mutex.new
       @next_voice_frame = 0_u32
-      @browser_frame_offset = 0_u32
-      @realign_browser_frame = false
+      # The outgoing Mumble timeline is owned by this connection and anchored to
+      # the gateway's monotonic clock. See wall_clock_frame for why the browser's
+      # RTP clock cannot be the anchor.
+      @voice_epoch = nil.as(Time::Instant?)
+      @voice_anchor_frame = 0_u32
+      @voice_anchor_browser_frame = 0_u32
+      @talkspurt_open = false
+      @last_browser_voice_at = nil.as(Time::Instant?)
+      @cue_active = false
+      @voice_slip_frames = 0_i64
+      @voice_resyncs = 0_u64
+      @voice_terminators = 0_u64
+      @voice_cue_dropped_packets = 0_u64
     end
 
     def on_voice(&block : UInt32, Bytes, UInt32? ->)
@@ -166,41 +185,132 @@ module Wumble
       authenticate
       spawn { read_loop }
       spawn { ping_loop }
+      spawn { voice_gap_loop }
+      spawn { voice_timeline_loop }
     end
 
     # Sends one browser-produced Opus packet as a MumbleUDP.Audio message.
-    # frame_number is measured in Mumble's 10 ms (480 sample) units.
+    # frame_number is measured in Mumble's 10 ms (480 sample) units and is the
+    # browser's own RTP clock, rebased by Peer#browser_frame_number.
+    #
+    # The browser's RTP clock stops whenever iOS takes the audio session away,
+    # and resumes where it stopped rather than where wall clock reached. Sending
+    # that clock straight to Mumble made the outgoing timeline lose the whole
+    # interruption, and a Mumble receiver absorbs a timeline that runs behind
+    # wall clock by delaying playout. Nothing repaid the loss, so every
+    # interruption added its own duration to the delay the other side heard.
+    # The gateway therefore owns the timeline and the browser only supplies the
+    # spacing within a talkspurt.
     def send_opus(opus : Bytes, frame_number : UInt32)
+      # The cue replaces browser audio rather than being inserted alongside it.
+      # Blocking here instead would queue these packets behind the cue and push
+      # every later packet 320 ms further behind wall clock.
+      if @cue_active
+        @voice_cue_dropped_packets += 1
+        return
+      end
       @voice_send_lock.synchronize do
-        if @realign_browser_frame
-          # Generated cue frames advance the outgoing stream while browser RTP
-          # is paused. Continue after the cue rather than jumping backwards to
-          # the browser's pre-interruption frame number.
-          @browser_frame_offset = @next_voice_frame &- frame_number
-          @realign_browser_frame = false
+        # Re-checked under the lock: the cue releases @voice_send_lock between
+        # its frames, so a packet that passed the check above must not slip
+        # into the middle of the cue.
+        next if @cue_active
+        now = Time.instant
+        wall_frame = wall_clock_frame(now)
+        anchored_frame = @voice_anchor_frame &+ (frame_number &- @voice_anchor_browser_frame)
+        @voice_slip_frames = anchored_frame.to_i64 - wall_frame.to_i64
+        # Re-anchor when there is no open talkspurt, and when the browser clock
+        # has slipped far enough from the gateway clock that continuing to
+        # follow the browser clock would build a permanent offset. One rule
+        # covers both a stopped capture and slow clock drift.
+        if !@talkspurt_open || @voice_slip_frames.abs > VOICE_RESYNC_FRAMES
+          close_talkspurt
+          @voice_resyncs += 1
+          @voice_anchor_frame = wall_frame
+          @voice_anchor_browser_frame = frame_number
+          @talkspurt_open = true
+          outgoing_frame = wall_frame
+        else
+          outgoing_frame = anchored_frame
         end
-        outgoing_frame = frame_number &+ @browser_frame_offset
         send_voice_packet(opus, outgoing_frame)
         @next_voice_frame = outgoing_frame &+ opus_duration_frames(opus)
+        @last_browser_voice_at = now
       end
     end
 
     # The cue is transmitted as ordinary Opus voice so every Mumble client
     # hears the same state transition. Muting uses high-to-low; unmuting uses
     # low-to-high. It does not alter Mumble self-mute state.
+    #
+    # Cue frames are numbered from the gateway clock, exactly like browser
+    # frames, so the 320 ms the cue occupies in the outgoing stream is the same
+    # 320 ms it occupies in wall clock. Browser packets arriving during the cue
+    # are dropped by send_opus.
     def play_mic_state_cue(muted : Bool)
       frequencies = muted ? {880.0, 440.0} : {440.0, 880.0}
-      # Keep the cue contiguous in the single outgoing Opus stream. Browser
-      # packets are not dropped or disabled; a packet arriving during these
-      # 320 ms waits briefly and is sent immediately after the cue.
-      @voice_send_lock.synchronize do
+      @cue_active = true
+      begin
+        @voice_send_lock.synchronize { close_talkspurt }
         OpusTone.each_two_tone(frequencies[0], frequencies[1]) do |opus|
-          send_voice_packet(opus, @next_voice_frame)
-          @next_voice_frame &+= 2_u32
+          @voice_send_lock.synchronize do
+            frame = wall_clock_frame(Time.instant)
+            send_voice_packet(opus, frame)
+            @next_voice_frame = frame &+ 2_u32
+          end
           sleep 20.milliseconds
         end
-        send_voice_terminator(@next_voice_frame)
-        @realign_browser_frame = true
+        @voice_send_lock.synchronize do
+          send_voice_terminator(wall_clock_frame(Time.instant))
+          @voice_terminators += 1
+        end
+      ensure
+        @cue_active = false
+      end
+    end
+
+    # Frame N of the outgoing stream is the frame that plays N * 10 ms after
+    # the first outgoing packet of this Mumble session. Wall clock is the only
+    # clock that keeps running while the browser's capture is interrupted, so
+    # wall clock is what the timeline is anchored to.
+    private def wall_clock_frame(now : Time::Instant) : UInt32
+      epoch = @voice_epoch ||= now
+      ((now - epoch).total_milliseconds / 10.0).to_i64.to_u32
+    end
+
+    # A Mumble receiver resets its jitter buffer when a talkspurt ends, so the
+    # terminator is what lets the other side drain any delay it has built up.
+    # Must be called with @voice_send_lock held.
+    private def close_talkspurt : Nil
+      return unless @talkspurt_open
+      @talkspurt_open = false
+      send_voice_terminator(@next_voice_frame)
+      @voice_terminators += 1
+    end
+
+    # End the talkspurt as soon as the browser stops sending rather than when it
+    # resumes. A Mumble receiver that is told the talkspurt ended stops waiting
+    # for the next frame number in sequence.
+    private def voice_gap_loop
+      until @closed
+        sleep VOICE_GAP_POLL
+        break if @closed
+        @voice_send_lock.synchronize do
+          last = @last_browser_voice_at
+          close_talkspurt if @talkspurt_open && last && Time.instant - last > VOICE_GAP_THRESHOLD
+        end
+      end
+    end
+
+    # The quantity this reports is the one that used to grow without bound:
+    # how far the outgoing frame numbering has slipped from wall clock. It is
+    # logged unconditionally rather than under WUMBLE_DEBUG because a slip that
+    # only appears during a real conversation is the whole failure mode.
+    private def voice_timeline_loop
+      until @closed
+        sleep VOICE_TIMELINE_REPORT
+        break if @closed
+        next unless @voice_epoch
+        STDERR.puts "Mumble voice timeline: slip_ms=#{@voice_slip_frames * 10} resyncs=#{@voice_resyncs} terminators=#{@voice_terminators} cue_dropped_packets=#{@voice_cue_dropped_packets}"
       end
     end
 
